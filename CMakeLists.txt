@@ -5,16 +5,25 @@ project(rwkv_lightning_libtorch LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(
-  Torch_DIR
-  "/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch"
-  CACHE PATH
-  "Path to the LibTorch CMake package"
-)
+set(Torch_DIR "" CACHE PATH "Path to the LibTorch CMake package")
+if(NOT Torch_DIR AND DEFINED ENV{Torch_DIR})
+  set(Torch_DIR "$ENV{Torch_DIR}" CACHE PATH "Path to the LibTorch CMake package" FORCE)
+endif()
+if(NOT Torch_DIR)
+  message(FATAL_ERROR "Torch_DIR is required. Pass -DTorch_DIR=/path/to/torch/share/cmake/Torch")
+endif()
 
 set(RWKV_BACKEND "cuda" CACHE STRING "Backend to build: cuda or hip")
 set_property(CACHE RWKV_BACKEND PROPERTY STRINGS cuda hip)
 set(TORCH_CUDA_ARCH_LIST "8.0" CACHE STRING "CUDA arch list for LibTorch build")
+
+if(RWKV_BACKEND STREQUAL "hip" AND NOT TARGET roc::hipsparselt)
+  # Some ROCm PyTorch wheels export torch_hip_library with a hard dependency on
+  # roc::hipsparselt even when hipsparselt is not installed. Provide a no-op
+  # imported target so CMake generation can proceed on systems without that
+  # optional package.
+  add_library(roc::hipsparselt INTERFACE IMPORTED)
+endif()
 
 find_package(Torch REQUIRED)
 find_package(SQLite3 REQUIRED)

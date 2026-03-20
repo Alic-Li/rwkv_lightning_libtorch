@@ -34,13 +34,13 @@ The exported `.pt` is a single-file tensor list:
 ## Build
 **For Nvidia CUDA**
 ```bash
-cmake -S . -B build -DRWKV_BACKEND=cuda
+cmake -S . -B build -DRWKV_BACKEND=cuda -DTorch_DIR=/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch
 cmake --build ./build -j 8 --target rwkv_backend_support benchmark rwkv_lightning
 ```
 **For AMD ROCm**
 
 ```bash
-cmake -S . -B build -DRWKV_BACKEND=hip
+cmake -S . -B build -DRWKV_BACKEND=hip -DTorch_DIR=/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch
 cmake --build ./build -j 8 --target rwkv_backend_support benchmark rwkv_lightning
 ```
 

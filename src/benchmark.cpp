@@ -10,7 +10,6 @@
 #include <string>
 #include <vector>
 
-#include <c10/cuda/CUDAGuard.h>
 #include <torch/cuda.h>
 
 namespace {
@@ -152,7 +151,6 @@ int main(int argc, char** argv) {
   require_arg(!weights_file.empty(), "--weights is required");
   require_arg(torch::cuda::is_available(), "CUDA is required");
 
-  c10::cuda::CUDAGuard device_guard(torch::Device(torch::kCUDA, 0));
   RWKVModel model(weights_file, torch::Device(torch::kCUDA, 0));
   trie_tokenizer tokenizer;
   require_arg(
