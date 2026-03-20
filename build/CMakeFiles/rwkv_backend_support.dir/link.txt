@@ -1,2 +1,0 @@
-/usr/bin/ar qc librwkv_backend_support.a CMakeFiles/rwkv_backend_support.dir/src/model_load/model_loader.cpp.o CMakeFiles/rwkv_backend_support.dir/src/infer/inference_engine.cpp.o CMakeFiles/rwkv_backend_support.dir/src/state_manager/state_pool.cpp.o
-/usr/bin/ranlib librwkv_backend_support.a

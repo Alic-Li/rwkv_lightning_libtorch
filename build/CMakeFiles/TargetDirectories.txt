@@ -1,6 +1,0 @@
-/home/alic-li/rwkv_lightning_libtorch/build/CMakeFiles/rwkv_infer_core.dir
-/home/alic-li/rwkv_lightning_libtorch/build/CMakeFiles/rwkv_backend_support.dir
-/home/alic-li/rwkv_lightning_libtorch/build/CMakeFiles/benchmark.dir
-/home/alic-li/rwkv_lightning_libtorch/build/CMakeFiles/rwkv_lightning.dir
-/home/alic-li/rwkv_lightning_libtorch/build/CMakeFiles/edit_cache.dir
-/home/alic-li/rwkv_lightning_libtorch/build/CMakeFiles/rebuild_cache.dir

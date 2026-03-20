@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/alic-li/rwkv_lightning_libtorch/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

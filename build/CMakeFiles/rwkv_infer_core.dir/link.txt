@@ -1,2 +1,0 @@
-/usr/bin/ar qc librwkv_infer_core.a CMakeFiles/rwkv_infer_core.dir/src/infer/rwkv_model.cpp.o CMakeFiles/rwkv_infer_core.dir/src/infer/utils/tokenizer.cpp.o CMakeFiles/rwkv_infer_core.dir/src/infer/cuda/rwkv7_state_fwd_fp16.cpp.o CMakeFiles/rwkv_infer_core.dir/src/infer/cuda/rwkv7_state_fwd_fp16.cu.o CMakeFiles/rwkv_infer_core.dir/src/infer/cuda/sampling.cu.o
-/usr/bin/ranlib librwkv_infer_core.a
