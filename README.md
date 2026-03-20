@@ -32,6 +32,10 @@ The exported `.pt` is a single-file tensor list:
 - all remaining tensors are stored in a fixed order
 
 ## Build
+**Install the Dorgon framework**
+
+- 🐉 https://github.com/drogonframework/drogon 
+
 **For Nvidia CUDA**
 ```bash
 cmake -S . -B build -DRWKV_BACKEND=cuda -DTorch_DIR=/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch
@@ -569,18 +573,3 @@ curl -X POST 'http://localhost:8000/big_batch/completions' \
   }'
 ```
 </details>
-
-
-
-
-
-```bash
-cmake -S . -B build
-cmake --build build -j
-```
-
-The LibTorch path is currently fixed to:
-
-`/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch`
-
-
