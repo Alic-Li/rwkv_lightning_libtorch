@@ -60,9 +60,10 @@ Single-sample decode:
 
 ```bash
 ./build/benchmark \
-  --weights weights/rwkv7-g1d-2.9b.pt \
-  --decode-prompt-ids 510,1234,42 \
-  --decode-steps 32
+    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.pt \
+    --decode-prompt "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
+    --decode-steps 512 \
+    --decode-temp 1.0
 ```
 
 Batch decode. `--batch-prompts` uses `;` to separate multiple prompt token
@@ -70,9 +71,11 @@ sequences:
 
 ```bash
 ./build/benchmark \
-  --weights weights/rwkv7-g1d-2.9b.pt \
-  --batch-prompts "510,1234,42;510,1234,42;510,1234,42;510,1234,42" \
-  --batch-steps 32
+    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.pt \
+    --batch-prompts-text "User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
+    --batch-size 8 \
+    --batch-steps 32 \
+    --batch-temp 1.2
 ```
 
 If only one `--batch-prompts` sequence is provided while `--batch-size > 1`,
