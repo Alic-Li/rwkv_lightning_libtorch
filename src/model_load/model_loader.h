@@ -14,4 +14,6 @@ struct LoadedModelContext {
   bool rocm_flag = false;
 };
 
-LoadedModelContext load_model_and_tokenizer(const std::string& model_path);
+LoadedModelContext load_model_and_tokenizer(
+    const std::string& model_path,
+    const std::string& vocab_path);

@@ -103,7 +103,7 @@ void require_arg(bool cond, const std::string& msg) {
 
 int main(int argc, char** argv) {
   std::string weights_file;
-  std::string vocab_file = "src/infer/rwkv_vocab_v20230424.txt";
+  std::string vocab_file;
   std::string decode_prompt_ids;
   std::string decode_prompt_text;
   int64_t decode_steps = 32;
@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
   }
 
   require_arg(!weights_file.empty(), "--weights is required");
+  require_arg(!vocab_file.empty(), "--vocab is required");
   require_arg(torch::cuda::is_available(), "CUDA is required");
 
   RWKVModel model(weights_file, torch::Device(torch::kCUDA, 0));

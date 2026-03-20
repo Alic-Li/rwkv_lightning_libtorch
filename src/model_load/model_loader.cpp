@@ -5,7 +5,9 @@
 #include <regex>
 #include <stdexcept>
 
-LoadedModelContext load_model_and_tokenizer(const std::string& model_path) {
+LoadedModelContext load_model_and_tokenizer(
+    const std::string& model_path,
+    const std::string& vocab_path) {
   namespace fs = std::filesystem;
 
   std::cout << "\n[INFO] Loading RWKV-7 model from " << model_path << "\n\n";
@@ -21,8 +23,8 @@ LoadedModelContext load_model_and_tokenizer(const std::string& model_path) {
   ctx.model = std::make_shared<RWKVModel>(model_path, device);
 
   auto tokenizer = std::make_shared<trie_tokenizer>();
-  if (tokenizer->load("src/infer/rwkv_vocab_v20230424.txt") != RWKV_SUCCESS) {
-    throw std::runtime_error("failed to load tokenizer vocab: src/infer/rwkv_vocab_v20230424.txt");
+  if (tokenizer->load(vocab_path) != RWKV_SUCCESS) {
+    throw std::runtime_error("failed to load tokenizer vocab: " + vocab_path);
   }
   ctx.tokenizer = std::move(tokenizer);
   ctx.rocm_flag = false;

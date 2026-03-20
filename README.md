@@ -48,9 +48,42 @@ cmake -S . -B build -DRWKV_BACKEND=hip -DTorch_DIR=/home/alic-li/python_env/py31
 cmake --build ./build -j 8 --target rwkv_backend_support benchmark rwkv_lightning
 ```
 
+## Deploy
+
+PyTorch / LibTorch is normally distributed as shared libraries, so this project
+is not packaged as a single fully-static ELF. For deployment, use the portable
+bundle target instead. It installs the executables plus `torch/lib` and the
+required `site-packages/nvidia/*/lib` runtime libraries into one directory with
+relative `rpath`.
+
+```bash
+cmake --build ./build -j 8 --target bundle
+```
+
+Bundle layout:
+
+```text
+build/dist/
+  bin/benchmark
+  bin/rwkv_lightning
+  torch/lib/*.so
+  nvidia/*/lib/*.so   # only runtime dependencies actually used
+```
+
+Run the bundled binary:
+
+```bash
+./build/dist/bin/benchmark \
+    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.rwkvmm \
+    --vocab /path/to/rwkv_vocab_v20230424.txt \
+    --decode-prompt "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
+    --decode-steps 512 \
+    --decode-temp 1.0
+```
+
 ## Usage
 ```bash
-./build/rwkv_lightning --port <your model path> --port <your port number> --password <your password>
+./build/rwkv_lightning --model-path <your model path> --vocab-path <your vocab path> --port <your port number> --password <your password>
 ```
 - if no password, you can do not add ```--password``` flag, "--port" default port is 8000.
 
@@ -60,7 +93,8 @@ Single-sample decode:
 
 ```bash
 ./build/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.pt \
+    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.rwkvmm \
+    --vocab /path/to/rwkv_vocab_v20230424.txt \
     --decode-prompt "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --decode-steps 512 \
     --decode-temp 1.0
@@ -71,7 +105,8 @@ sequences:
 
 ```bash
 ./build/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.pt \
+    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.rwkvmm \
+    --vocab /path/to/rwkv_vocab_v20230424.txt \
     --batch-prompts-text "User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --batch-size 8 \
     --batch-steps 32 \

@@ -26,6 +26,7 @@ void handle_signal(int) {
 
 int main(int argc, char* argv[]) {
   std::string model_path;
+  std::string vocab_path;
   uint16_t port = 8000;
   std::optional<std::string> password;
 
@@ -39,6 +40,8 @@ int main(int argc, char* argv[]) {
     };
     if (arg == "--model-path") {
       model_path = require_value(arg);
+    } else if (arg == "--vocab-path") {
+      vocab_path = require_value(arg);
     } else if (arg == "--port") {
       port = static_cast<uint16_t>(std::stoi(require_value(arg)));
     } else if (arg == "--password") {
@@ -51,8 +54,11 @@ int main(int argc, char* argv[]) {
   if (model_path.empty()) {
     throw std::runtime_error("--model-path is required");
   }
+  if (vocab_path.empty()) {
+    throw std::runtime_error("--vocab-path is required");
+  }
 
-  auto ctx = load_model_and_tokenizer(model_path);
+  auto ctx = load_model_and_tokenizer(model_path, vocab_path);
   InferenceEngine engine(ctx.model, ctx.tokenizer, ctx.model_name);
   StateCacheManager::instance().initialize(torch::Device(torch::kCUDA, 0));
 

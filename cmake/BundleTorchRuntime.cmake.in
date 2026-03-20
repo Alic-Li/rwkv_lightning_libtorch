@@ -1,0 +1,41 @@
+set(_rwkv_install_prefix "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
+set(_rwkv_torch_runtime_dir "@TORCH_RUNTIME_DIR@")
+set(_rwkv_torch_site_packages_root "@TORCH_SITE_PACKAGES_ROOT@")
+set(_rwkv_target_paths_joined "@RWKV_BUNDLE_TARGET_PATHS_JOINED@")
+
+string(REPLACE "|" ";" _rwkv_target_paths "${_rwkv_target_paths_joined}")
+file(GLOB _rwkv_nvidia_runtime_dirs LIST_DIRECTORIES true "${_rwkv_torch_site_packages_root}/nvidia/*/lib")
+set(_rwkv_dependency_dirs "${_rwkv_torch_runtime_dir}" ${_rwkv_nvidia_runtime_dirs})
+
+file(GET_RUNTIME_DEPENDENCIES
+  EXECUTABLES ${_rwkv_target_paths}
+  DIRECTORIES ${_rwkv_dependency_dirs}
+  RESOLVED_DEPENDENCIES_VAR _rwkv_resolved_deps
+  UNRESOLVED_DEPENDENCIES_VAR _rwkv_unresolved_deps
+)
+
+foreach(_rwkv_dep IN LISTS _rwkv_resolved_deps)
+  if(_rwkv_dep MATCHES "^${_rwkv_torch_runtime_dir}/")
+    file(MAKE_DIRECTORY "${_rwkv_install_prefix}/torch/lib")
+    file(INSTALL DESTINATION "${_rwkv_install_prefix}/torch/lib" TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES "${_rwkv_dep}")
+    continue()
+  endif()
+
+  if(_rwkv_dep MATCHES "^${_rwkv_torch_site_packages_root}/nvidia/")
+    file(RELATIVE_PATH _rwkv_dep_rel "${_rwkv_torch_site_packages_root}/nvidia" "${_rwkv_dep}")
+    get_filename_component(_rwkv_dep_dir "${_rwkv_dep_rel}" DIRECTORY)
+    file(MAKE_DIRECTORY "${_rwkv_install_prefix}/nvidia/${_rwkv_dep_dir}")
+    file(INSTALL DESTINATION "${_rwkv_install_prefix}/nvidia/${_rwkv_dep_dir}" TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES "${_rwkv_dep}")
+    continue()
+  endif()
+
+  get_filename_component(_rwkv_dep_name "${_rwkv_dep}" NAME)
+  if(_rwkv_dep_name MATCHES "^(libdrogon|libtrantor|libjsoncpp|libyaml-cpp|libhiredis|libcares|libpq|libmariadb|libssl|libcrypto|libbrotlidec|libbrotlienc|libbrotlicommon|libgssapi_krb5|libldap|liblber|libsasl2|libkrb5|libk5crypto|libcom_err|libkrb5support|libkeyutils)\\.so")
+    file(MAKE_DIRECTORY "${_rwkv_install_prefix}/third_party/lib")
+    file(INSTALL DESTINATION "${_rwkv_install_prefix}/third_party/lib" TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES "${_rwkv_dep}")
+  endif()
+endforeach()
+
+if(_rwkv_unresolved_deps)
+  message(WARNING "Unresolved runtime dependencies while bundling: ${_rwkv_unresolved_deps}")
+endif()
