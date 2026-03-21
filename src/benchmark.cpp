@@ -99,6 +99,22 @@ void require_arg(bool cond, const std::string& msg) {
   }
 }
 
+std::vector<int64_t> parse_prompt(
+    trie_tokenizer& tokenizer,
+    const std::string& prompt_ids,
+    const std::string& prompt_text,
+    const std::string& ids_flag,
+    const std::string& text_flag) {
+  require_arg(
+      prompt_ids.empty() || prompt_text.empty(),
+      "use only one of " + ids_flag + " or " + text_flag);
+  auto prompt =
+      !prompt_text.empty() ? to_i64(tokenizer.encode(prompt_text))
+                           : parse_ids(prompt_ids);
+  require_arg(!prompt.empty(), "prompt must not be empty");
+  return prompt;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -158,14 +174,18 @@ int main(int argc, char** argv) {
       tokenizer.load(vocab_file) == RWKV_SUCCESS,
       "failed to load vocab: " + vocab_file);
 
-  if (!decode_prompt_ids.empty() || !decode_prompt_text.empty()) {
+  const bool batch_mode_requested =
+      !batch_prompts_arg.empty() || !batch_prompts_text.empty() || batch_size > 0;
+
+  if ((!decode_prompt_ids.empty() || !decode_prompt_text.empty()) &&
+      !batch_mode_requested) {
     xprint("Decode");
-    require_arg(
-        decode_prompt_ids.empty() || decode_prompt_text.empty(),
-        "use only one of --decode-prompt-ids or --decode-prompt");
-    auto prompt = !decode_prompt_text.empty() ? to_i64(tokenizer.encode(decode_prompt_text))
-                                              : parse_ids(decode_prompt_ids);
-    require_arg(!prompt.empty(), "decode prompt must not be empty");
+    auto prompt = parse_prompt(
+        tokenizer,
+        decode_prompt_ids,
+        decode_prompt_text,
+        "--decode-prompt-ids",
+        "--decode-prompt");
 
     if (!decode_prompt_text.empty()) {
       std::cout << decode_prompt_text;
@@ -228,7 +248,7 @@ int main(int argc, char** argv) {
               << " (full) || total " << elapsed << "s\n";
   }
 
-  if (!batch_prompts_arg.empty() || !batch_prompts_text.empty() || batch_size > 0) {
+  if (batch_mode_requested) {
     xprint("Decode (batch)");
     require_arg(
         batch_prompts_arg.empty() || batch_prompts_text.empty(),
@@ -241,8 +261,17 @@ int main(int argc, char** argv) {
       if (prompts.size() == 1 && batch_size > 1) {
         prompts.resize(batch_size, prompts.front());
       }
-    } else {
+    } else if (!batch_prompts_arg.empty()) {
       prompts = parse_batch_prompts(batch_prompts_arg, batch_size);
+    } else if (!decode_prompt_ids.empty() || !decode_prompt_text.empty()) {
+      auto prompt = parse_prompt(
+          tokenizer,
+          decode_prompt_ids,
+          decode_prompt_text,
+          "--decode-prompt-ids",
+          "--decode-prompt");
+      const int64_t effective_batch_size = batch_size > 0 ? batch_size : 1;
+      prompts.resize(effective_batch_size, prompt);
     }
     require_arg(!prompts.empty(), "batch prompts must not be empty");
     if (batch_size == 0) {

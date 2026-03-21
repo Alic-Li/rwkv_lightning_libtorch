@@ -74,6 +74,7 @@ endif()
 add_library(
   rwkv_infer_core
   src/infer/rwkv_model.cpp
+  src/model_load/safetensors_loader.cpp
   src/infer/utils/tokenizer.cpp
   ${RWKV_BACKEND_SOURCES}
 )

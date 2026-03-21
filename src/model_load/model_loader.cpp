@@ -15,7 +15,7 @@ LoadedModelContext load_model_and_tokenizer(
   LoadedModelContext ctx;
   ctx.model_path = model_path;
   ctx.model_name = fs::path(model_path).filename().string();
-  if (fs::path(model_path).extension() == ".pth") {
+  if (fs::path(model_path).has_extension()) {
     ctx.model_name = fs::path(model_path).stem().string();
   }
 

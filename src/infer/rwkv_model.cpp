@@ -1,9 +1,8 @@
 #include "rwkv_model.h"
 
-#include <fstream>
-#include <iterator>
 #include <stdexcept>
 
+#include "model_load/safetensors_loader.h"
 #include <torch/nn/functional/linear.h>
 #include <torch/nn/functional/normalization.h>
 
@@ -61,22 +60,68 @@ torch::Tensor normalize_last_dim(const torch::Tensor& x) {
   return F::normalize(x, F::NormalizeFuncOptions().p(2.0).dim(-1));
 }
 
+std::vector<std::string> expected_tensor_names(int64_t n_layer) {
+  std::vector<std::string> names = {
+      "__meta__",
+      "emb.weight",
+      "ln_out.weight",
+      "ln_out.bias",
+      "head.weight",
+  };
+  names.reserve(5 + static_cast<size_t>(n_layer) * 33);
+
+  for (int64_t i = 0; i < n_layer; ++i) {
+    const std::string bbb = "blocks." + std::to_string(i) + ".";
+    const std::string att = bbb + "att.";
+    const std::string ffn = bbb + "ffn.";
+    names.insert(
+        names.end(),
+        {
+            bbb + "ln1.weight",
+            bbb + "ln1.bias",
+            bbb + "ln2.weight",
+            bbb + "ln2.bias",
+            att + "x_r",
+            att + "x_w",
+            att + "x_k",
+            att + "x_v",
+            att + "x_a",
+            att + "x_g",
+            att + "w0",
+            att + "w1",
+            att + "w2",
+            att + "a0",
+            att + "a1",
+            att + "a2",
+            att + "v0",
+            att + "v1",
+            att + "v2",
+            att + "g1",
+            att + "g2",
+            att + "k_k",
+            att + "k_a",
+            att + "r_k",
+            att + "receptance.weight",
+            att + "key.weight",
+            att + "value.weight",
+            att + "output.weight",
+            att + "ln_x.weight",
+            att + "ln_x.bias",
+            ffn + "x_k",
+            ffn + "key.weight",
+            ffn + "value.weight",
+        });
+  }
+  return names;
+}
+
 }  // namespace
 
 RWKVModel::RWKVModel(const std::string& weights_file, torch::Device device)
     : device_(std::move(device)) {
-  std::ifstream in(weights_file, std::ios::binary);
-  TORCH_CHECK(in.good(), "failed to open weights file: ", weights_file);
-  std::vector<char> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  TORCH_CHECK(!bytes.empty(), "empty weights file: ", weights_file);
+  SafeTensorArchive archive(weights_file);
 
-  auto iv = torch::pickle_load(bytes);
-  TORCH_CHECK(iv.isTensorList(), "weights pickle must contain a tensor list");
-  std::vector<torch::Tensor> tensors = iv.toTensorVector();
-  TORCH_CHECK(!tensors.empty(), "empty tensor list in weights file: ", weights_file);
-
-  size_t idx = 0;
-  auto meta = tensors[idx++].to(torch::kCPU, torch::kInt64);
+  auto meta = archive.load_tensor("__meta__", torch::kCPU).to(torch::kInt64);
   TORCH_CHECK(meta.numel() == 5, "invalid meta tensor in ", weights_file);
   n_layer_ = meta[0].item<int64_t>();
   n_head_ = meta[1].item<int64_t>();
@@ -84,54 +129,67 @@ RWKVModel::RWKVModel(const std::string& weights_file, torch::Device device)
   n_embd_ = meta[3].item<int64_t>();
   vocab_size_ = meta[4].item<int64_t>();
 
-  emb_weight_ = take_tensor(tensors, idx);
-  ln_out_weight_ = take_tensor(tensors, idx);
-  ln_out_bias_ = take_tensor(tensors, idx);
-  head_weight_ = take_tensor(tensors, idx);
+  auto expected_names = expected_tensor_names(n_layer_);
+  TORCH_CHECK(
+      archive.tensor_count() >= expected_names.size(),
+      "weights file is missing tensors in ",
+      weights_file,
+      ": expected at least ",
+      expected_names.size(),
+      ", got only ",
+      archive.tensor_count());
+
+  emb_weight_ = archive.load_tensor("emb.weight", device_);
+  ln_out_weight_ = archive.load_tensor("ln_out.weight", device_);
+  ln_out_bias_ = archive.load_tensor("ln_out.bias", device_);
+  head_weight_ = archive.load_tensor("head.weight", device_);
 
   layers_.reserve(n_layer_);
   for (int64_t i = 0; i < n_layer_; ++i) {
+    const std::string bbb = "blocks." + std::to_string(i) + ".";
+    const std::string att = bbb + "att.";
+    const std::string ffn = bbb + "ffn.";
     RWKVLayerWeights layer;
-    layer.ln1_weight = take_tensor(tensors, idx);
-    layer.ln1_bias = take_tensor(tensors, idx);
-    layer.ln2_weight = take_tensor(tensors, idx);
-    layer.ln2_bias = take_tensor(tensors, idx);
+    layer.ln1_weight = archive.load_tensor(bbb + "ln1.weight", device_);
+    layer.ln1_bias = archive.load_tensor(bbb + "ln1.bias", device_);
+    layer.ln2_weight = archive.load_tensor(bbb + "ln2.weight", device_);
+    layer.ln2_bias = archive.load_tensor(bbb + "ln2.bias", device_);
 
-    layer.att_x_r = take_tensor(tensors, idx);
-    layer.att_x_w = take_tensor(tensors, idx);
-    layer.att_x_k = take_tensor(tensors, idx);
-    layer.att_x_v = take_tensor(tensors, idx);
-    layer.att_x_a = take_tensor(tensors, idx);
-    layer.att_x_g = take_tensor(tensors, idx);
-    layer.att_w0 = take_tensor(tensors, idx);
-    layer.att_w1 = take_tensor(tensors, idx);
-    layer.att_w2 = take_tensor(tensors, idx);
-    layer.att_a0 = take_tensor(tensors, idx);
-    layer.att_a1 = take_tensor(tensors, idx);
-    layer.att_a2 = take_tensor(tensors, idx);
-    layer.att_v0 = take_tensor(tensors, idx);
-    layer.att_v1 = take_tensor(tensors, idx);
-    layer.att_v2 = take_tensor(tensors, idx);
-    layer.att_g1 = take_tensor(tensors, idx);
-    layer.att_g2 = take_tensor(tensors, idx);
-    layer.att_k_k = take_tensor(tensors, idx);
-    layer.att_k_a = take_tensor(tensors, idx);
-    layer.att_r_k = take_tensor(tensors, idx);
-    layer.att_receptance_weight = take_tensor(tensors, idx);
-    layer.att_key_weight = take_tensor(tensors, idx);
-    layer.att_value_weight = take_tensor(tensors, idx);
-    layer.att_output_weight = take_tensor(tensors, idx);
-    layer.att_ln_x_weight = take_tensor(tensors, idx);
-    layer.att_ln_x_bias = take_tensor(tensors, idx);
+    layer.att_x_r = archive.load_tensor(att + "x_r", device_);
+    layer.att_x_w = archive.load_tensor(att + "x_w", device_);
+    layer.att_x_k = archive.load_tensor(att + "x_k", device_);
+    layer.att_x_v = archive.load_tensor(att + "x_v", device_);
+    layer.att_x_a = archive.load_tensor(att + "x_a", device_);
+    layer.att_x_g = archive.load_tensor(att + "x_g", device_);
+    layer.att_w0 = archive.load_tensor(att + "w0", device_);
+    layer.att_w1 = archive.load_tensor(att + "w1", device_);
+    layer.att_w2 = archive.load_tensor(att + "w2", device_);
+    layer.att_a0 = archive.load_tensor(att + "a0", device_);
+    layer.att_a1 = archive.load_tensor(att + "a1", device_);
+    layer.att_a2 = archive.load_tensor(att + "a2", device_);
+    layer.att_v0 = archive.load_tensor(att + "v0", device_);
+    layer.att_v1 = archive.load_tensor(att + "v1", device_);
+    layer.att_v2 = archive.load_tensor(att + "v2", device_);
+    layer.att_g1 = archive.load_tensor(att + "g1", device_);
+    layer.att_g2 = archive.load_tensor(att + "g2", device_);
+    layer.att_k_k = archive.load_tensor(att + "k_k", device_);
+    layer.att_k_a = archive.load_tensor(att + "k_a", device_);
+    layer.att_r_k = archive.load_tensor(att + "r_k", device_);
+    layer.att_receptance_weight =
+        archive.load_tensor(att + "receptance.weight", device_);
+    layer.att_key_weight = archive.load_tensor(att + "key.weight", device_);
+    layer.att_value_weight = archive.load_tensor(att + "value.weight", device_);
+    layer.att_output_weight =
+        archive.load_tensor(att + "output.weight", device_);
+    layer.att_ln_x_weight = archive.load_tensor(att + "ln_x.weight", device_);
+    layer.att_ln_x_bias = archive.load_tensor(att + "ln_x.bias", device_);
 
-    layer.ffn_x_k = take_tensor(tensors, idx);
-    layer.ffn_key_weight = take_tensor(tensors, idx);
-    layer.ffn_value_weight = take_tensor(tensors, idx);
+    layer.ffn_x_k = archive.load_tensor(ffn + "x_k", device_);
+    layer.ffn_key_weight = archive.load_tensor(ffn + "key.weight", device_);
+    layer.ffn_value_weight = archive.load_tensor(ffn + "value.weight", device_);
 
     layers_.push_back(std::move(layer));
   }
-
-  TORCH_CHECK(idx == tensors.size(), "unexpected tensor count in ", weights_file);
 }
 
 RWKVState RWKVModel::generate_zero_state(int64_t batch_size) const {
@@ -438,11 +496,4 @@ torch::Tensor RWKVModel::cmix_one(
   auto vv = layer.ffn_value_weight.contiguous();
   spmv_forward(vv.size(0), vv.size(1), kk, vv, out);
   return out;
-}
-
-torch::Tensor RWKVModel::take_tensor(
-    const std::vector<torch::Tensor>& tensors,
-    size_t& index) const {
-  TORCH_CHECK(index < tensors.size(), "weights tensor index overflow");
-  return tensors[index++].to(device_, torch::kFloat16).contiguous();
 }

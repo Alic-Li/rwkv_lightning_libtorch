@@ -5,7 +5,6 @@
 #include <utility>
 #include <vector>
 
-#include <torch/serialize.h>
 #include <torch/torch.h>
 
 struct RWKVLayerWeights {
@@ -102,10 +101,6 @@ class RWKVModel {
       const torch::Tensor& x,
       torch::Tensor x_prev,
       const RWKVLayerWeights& layer) const;
-
-  torch::Tensor take_tensor(
-      const std::vector<torch::Tensor>& tensors,
-      size_t& index) const;
 
   torch::Device device_;
   int64_t n_layer_ = 0;

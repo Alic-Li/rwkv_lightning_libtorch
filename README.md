@@ -4,18 +4,15 @@ RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatros
 
 ## Export Weights
 
-The original Python `.pth` checkpoint is a `torch.save` state dict. It must be
-preprocessed once and exported to a single `.pt` file first.
-
-The exported `.pt` is not a regular `torch.save` file. It is a pickle container
-designed specifically for C++ `torch::pickle_load`.
+The original Python checkpoint is a `torch.save` state dict. It must be
+preprocessed once and exported to a single `.safetensors` file first.
 
 ```bash
 cd rwkv_lightning_libtorch
 
-python export_rwkv7_weights.py \
-  --model /mnt/pc411_data/rwkv_translate/rwkv7-g1d-2.9b-20260131-ctx8192 \
-  --out weights/rwkv7-g1d-2.9b.pt
+python pth2st.py \
+  --model /mnt/sda1/rwkv_weights/rwkv7-g1e-7.2b-20260301-ctx8192.pth \
+  --out /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
 ```
 
 This script applies the same weight preprocessing used by Albatross:
@@ -26,10 +23,8 @@ This script applies the same weight preprocessing used by Albatross:
 - apply `blocks.0.ln0` to `emb.weight`
 - rename `blocks.0.att.v0/v1/v2` to `a0/a1/a2`
 
-The exported `.pt` is a single-file tensor list:
-
-- the first tensor stores model metadata
-- all remaining tensors are stored in a fixed order
+The exported `.safetensors` stores model metadata in `__meta__` and all
+preprocessed weights by tensor name.
 
 ## Build
 **Install the Dorgon framework**
@@ -74,8 +69,8 @@ Run the bundled binary:
 
 ```bash
 ./build/dist/bin/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.rwkvmm \
-    --vocab /path/to/rwkv_vocab_v20230424.txt \
+    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
+    --vocab src/infer/rwkv_vocab_v20230424.txt \
     --decode-prompt "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --decode-steps 512 \
     --decode-temp 1.0
@@ -93,8 +88,8 @@ Single-sample decode:
 
 ```bash
 ./build/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.rwkvmm \
-    --vocab /path/to/rwkv_vocab_v20230424.txt \
+    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
+    --vocab src/infer/rwkv_vocab_v20230424.txt \
     --decode-prompt "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --decode-steps 512 \
     --decode-temp 1.0
@@ -105,9 +100,9 @@ sequences:
 
 ```bash
 ./build/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_pt/rwkv7-g1d-2.9b.rwkvmm \
-    --vocab /path/to/rwkv_vocab_v20230424.txt \
-    --batch-prompts-text "User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think;User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
+    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
+    --vocab src/infer/rwkv_vocab_v20230424.txt \
+    --batch-prompts-text "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --batch-size 8 \
     --batch-steps 32 \
     --batch-temp 1.2
@@ -115,6 +110,11 @@ sequences:
 
 If only one `--batch-prompts` sequence is provided while `--batch-size > 1`,
 the program will automatically replicate that prompt across the batch.
+
+You can also omit `--batch-prompts` / `--batch-prompts-text` entirely and pass a
+single `--decode-prompt` or `--decode-prompt-ids` together with
+`--batch-size`; the benchmark will replicate that single prompt across the
+whole batch automatically.
 
 ## API Docs 
 
