@@ -260,8 +260,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_repetitio
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    uint4 cnt = {(unsigned)V, 0, 0, 0};
+    l4 = {1, 0, 0, 0};
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
         // if(t==0){
@@ -592,8 +592,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_temperatu
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    uint4 cnt = {(unsigned)V, 0, 0, 0};
+    l4 = {1, 0, 0, 0};
     uint4 pivot;
     while ((cnt.x > top_k || l4.x > top_p) && left < right-1) {
         pivot.x = left;
@@ -828,8 +828,8 @@ __global__ void __launch_bounds__(BLOCKDIM_X_SAMPLE, 1) batch_sampling_topp_kern
     // if(t==0) P0f(pmax);
     unsigned left =  __float_as_uint(pmin), right =  __float_as_uint(pmax) + 1;
 
-    // uint4 cnt = {.x=(unsigned)V, .y=0, .z=0, .w=0};
-    l4 = {.x=1, .y=0, .z=0, .w=0};
+    // uint4 cnt = {(unsigned)V, 0, 0, 0};
+    l4 = {1, 0, 0, 0};
     uint4 pivot;
     while ((l4.x > top_p) && left < right-1) {
         pivot.x = left;

@@ -21,6 +21,23 @@ set(RWKV_BACKEND "cuda" CACHE STRING "Backend to build: cuda or hip")
 set_property(CACHE RWKV_BACKEND PROPERTY STRINGS cuda hip)
 set(TORCH_CUDA_ARCH_LIST "8.0" CACHE STRING "CUDA arch list for LibTorch build")
 
+if(MSVC)
+    add_definitions(-DNOMINMAX)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/O2>
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CXX>:/wd4819>
+        $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+    )
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/wd4819>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+    )
+else()
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-O3>)
+endif()
+
 if(RWKV_BACKEND STREQUAL "hip" AND NOT TARGET roc::hipsparselt)
   # Some ROCm PyTorch wheels export torch_hip_library with a hard dependency on
   # roc::hipsparselt even when hipsparselt is not installed. Provide a no-op
@@ -48,6 +65,10 @@ if(RWKV_BACKEND STREQUAL "cuda")
   set(CMAKE_CUDA_STANDARD 17)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   find_package(CUDAToolkit REQUIRED)
+
+  if(MSVC)
+    string(APPEND CMAKE_CUDA_FLAGS " -Xcompiler=/Zc:preprocessor -Xcompiler=/wd4819")
+  endif()
 
   set(
     RWKV_BACKEND_SOURCES
@@ -167,9 +188,9 @@ if(TARGET rwkv_lightning)
 endif()
 
 if(RWKV_BUNDLE_RUNTIME AND EXISTS "${TORCH_RUNTIME_DIR}")
-  set(RWKV_BUNDLE_TARGET_PATHS "\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/benchmark")
+  set(RWKV_BUNDLE_TARGET_PATHS "\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/benchmark${CMAKE_EXECUTABLE_SUFFIX}")
   if(TARGET rwkv_lightning)
-    list(APPEND RWKV_BUNDLE_TARGET_PATHS "\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/rwkv_lightning")
+    list(APPEND RWKV_BUNDLE_TARGET_PATHS "\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_BINDIR}/rwkv_lightning${CMAKE_EXECUTABLE_SUFFIX}")
   endif()
   string(REPLACE ";" "|" RWKV_BUNDLE_TARGET_PATHS_JOINED "${RWKV_BUNDLE_TARGET_PATHS}")
 

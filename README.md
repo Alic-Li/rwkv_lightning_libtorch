@@ -33,13 +33,13 @@ preprocessed weights by tensor name.
 
 **For Nvidia CUDA**
 ```bash
-cmake -S . -B build -DRWKV_BACKEND=cuda -DTorch_DIR=/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch
+cmake -S . -B build -DRWKV_BACKEND=cuda -DTorch_DIR=/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch -DTORCH_CUDA_ARCH_LIST="8.6;8.9;10.0"
 cmake --build ./build -j 8 --target rwkv_backend_support benchmark rwkv_lightning
 ```
 **For AMD ROCm**
 
 ```bash
-cmake -S . -B build -DRWKV_BACKEND=hip -DTorch_DIR=/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch
+cmake -S . -B build -DRWKV_BACKEND=hip -DTorch_DIR=/home/alic-li/python_env/py312/lib/python3.12/site-packages/torch/share/cmake/Torch -DTORCH_CUDA_ARCH_LIST="8.6;8.9;10.0"
 cmake --build ./build -j 8 --target rwkv_backend_support benchmark rwkv_lightning
 ```
 
@@ -52,6 +52,13 @@ required `site-packages/nvidia/*/lib` runtime libraries into one directory with
 relative `rpath`.
 
 ```bash
+cmake --build ./build -j 8 --target bundle
+```
+if windows, you need to use ```$env:CudaToolkitDir="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\"``` & ```-DCMAKE_TOOLCHAIN_FILE``` with vcpkg to build
+
+such as 
+```bash
+cmake -S . -B build -DRWKV_BACKEND=cuda -DTorch_DIR="D:\statetuning\statetuning_repo\python_venv\Lib\site-packages\torch\share\cmake\Torch" -DCMAKE_TOOLCHAIN_FILE="D:/vcpkg/scripts/buildsystems/vcpkg.cmake" -DTORCH_CUDA_ARCH_LIST="8.6;8.9;10.0" -DCMAKE_CXX_FLAGS="/Zc:preprocessor" -DCMAKE_CUDA_FLAGS="-Xcompiler=/Zc:preprocessor"
 cmake --build ./build -j 8 --target bundle
 ```
 
