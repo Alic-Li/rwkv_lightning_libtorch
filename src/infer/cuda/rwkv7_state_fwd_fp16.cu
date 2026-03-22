@@ -6,7 +6,7 @@
 #include <assert.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
-
+#include <cuda/pipeline>
 #include <cuda_fp16.h>
 
 #ifndef _N_
@@ -180,44 +180,44 @@ union common128 {
 };
 
 template <int N>
-__device__ __forceinline__ void cp_async_gs_conditional(void const *const smem_addr,
-                                       void const *const global_ptr, bool cond) {
+__device__ __forceinline__ void memcpy_async_gs_conditional(
+    void* smem_addr,
+    const void* global_ptr,
+    bool cond,
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+
     static_assert(N == 16 || N == 8 || N == 4);
-    int bytes = cond ? N : 0;
-    unsigned int addr = __cvta_generic_to_shared(smem_addr);
-    if constexpr (N == 16) {
-        asm volatile(
-            #if ENABLE_L2_PREFETCH
-            "cp.async.cg.shared.global.L2::128B [%0], [%1], %2, %3;"
-            #else
-            "cp.async.cg.shared.global [%0], [%1], %2, %3;"
-            #endif
-            ::"r"(addr),
-            "l"(global_ptr), "n"(N), "r"(bytes));
+
+    if (cond) {
+        cuda::memcpy_async(
+            smem_addr,
+            global_ptr,
+            cuda::aligned_size_t<N>(N),
+            pipe);
     } else {
-        asm volatile(
-            #if ENABLE_L2_PREFETCH
-            "cp.async.ca.shared.global.L2::128B [%0], [%1], %2, %3;"
-            #else
-            "cp.async.ca.shared.global [%0], [%1], %2, %3;"
-            #endif
-            ::"r"(addr),
-            "l"(global_ptr), "n"(N), "r"(bytes));
+        // 模拟 cp.async 的 bytes=0 零填充语义
+        if constexpr (N == 16) {
+            *reinterpret_cast<int4*>(smem_addr) = make_int4(0, 0, 0, 0);
+        } else if constexpr (N == 8) {
+            *reinterpret_cast<int2*>(smem_addr) = make_int2(0, 0);
+        } else {
+            *reinterpret_cast<int*>(smem_addr) = 0;
+        }
     }
+}
+
+__device__ __forceinline__ void memcpy_async_commit(
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+    pipe.producer_commit();
 }
 
 template <int N>
-__device__ __forceinline__ void cp_async_wait() {
-    if constexpr (N == 0) {
-        asm volatile("cp.async.wait_all;\n" ::);
-    } else {
-        asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
-    }
+__device__ __forceinline__ void memcpy_async_wait(
+    cuda::pipeline<cuda::thread_scope_thread>& pipe) {
+    // pipe.pipeline_consumer_wait_prior<N>();
+    cuda::pipeline_consumer_wait_prior<N>(pipe);
 }
 
-__device__ __forceinline__ void cp_async_commit() {
-    asm volatile("cp.async.commit_group;\n" ::);
-}
 
 __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
     const int C,
@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
     const int by = blockIdx.y;
     const int t = threadIdx.x;
     const int start_pos = bx * MAXNPERBLOCK;
-
+    auto pipe = cuda::make_pipeline();
     if (t < 32){
         *(half2*)(vec_slice + t*2) = *(const half2*)(vec + start_pos + t*2);
     }
@@ -265,14 +265,14 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
     for(int i = 0; i < 2; i++){
         if (i < nnz_count){
             int actual_pos = start_pos + nnz_ids[i];
-            cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
-            cp_async_commit();
+            memcpy_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true, pipe);
+            memcpy_async_commit(pipe);
         }
     }
     // main for
     for(int i = 0; i < nnz_count-2; i++){
         // take data
-        cp_async_wait<1>();
+        memcpy_async_wait<1>(pipe);
         __syncthreads();
 
         half2 mat_row_frag = *(half2*) (mat_row_smem[i%2] + t*2);
@@ -280,8 +280,8 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
 
         // store
         int actual_pos = start_pos + nnz_ids[i+2];
-        cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
-        cp_async_commit();
+        memcpy_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true, pipe);
+        memcpy_async_commit(pipe);
 
         // compute
         out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
@@ -289,7 +289,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
 
     // end
     if (nnz_count >= 2){
-        cp_async_wait<1>();
+        memcpy_async_wait<1>(pipe);
         __syncthreads();
 
         half2 mat_row_frag = *(half2*) (mat_row_smem[nnz_count%2] + t*2);
@@ -298,7 +298,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
         out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
     }
     if (nnz_count >= 1){
-        cp_async_wait<0>();
+        memcpy_async_wait<0>(pipe);
         __syncthreads();
 
         half2 mat_row_frag = *(half2*) (mat_row_smem[(nnz_count+1)%2] + t*2);
