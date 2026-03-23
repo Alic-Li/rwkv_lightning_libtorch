@@ -6,7 +6,7 @@
 #include <assert.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
-#include <cuda/pipeline>
+
 #include <cuda_fp16.h>
 
 #ifndef _N_
@@ -179,44 +179,10 @@ union common128 {
     float f[4];
 };
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
-using rwkv_async_pipeline_t = cuda::pipeline<cuda::thread_scope_thread>;
-#define RWKV_ASYNC_PIPE_TAIL_DECL , rwkv_async_pipeline_t& pipe
-#define RWKV_ASYNC_PIPE_TAIL_PASS , pipe
-#define RWKV_ASYNC_PIPE_DECL rwkv_async_pipeline_t& pipe
-#define RWKV_ASYNC_PIPE_PASS pipe
-#define RWKV_ASYNC_PIPE_INIT auto pipe = cuda::make_pipeline();
-#else
-struct rwkv_async_pipeline_t {};
-#define RWKV_ASYNC_PIPE_TAIL_DECL
-#define RWKV_ASYNC_PIPE_TAIL_PASS
-#define RWKV_ASYNC_PIPE_DECL
-#define RWKV_ASYNC_PIPE_PASS
-#define RWKV_ASYNC_PIPE_INIT
-#endif
-
 template <int N>
 __device__ __forceinline__ void cp_async_gs_conditional(void const *const smem_addr,
-                                       void const *const global_ptr, bool cond
-                                       RWKV_ASYNC_PIPE_TAIL_DECL) {
+                                       void const *const global_ptr, bool cond) {
     static_assert(N == 16 || N == 8 || N == 4);
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
-    if (cond) {
-        cuda::memcpy_async(
-            const_cast<void *>(smem_addr),
-            global_ptr,
-            cuda::aligned_size_t<N>(N),
-            pipe);
-    } else {
-        if constexpr (N == 16) {
-            *reinterpret_cast<int4 *>(const_cast<void *>(smem_addr)) = make_int4(0, 0, 0, 0);
-        } else if constexpr (N == 8) {
-            *reinterpret_cast<int2 *>(const_cast<void *>(smem_addr)) = make_int2(0, 0);
-        } else {
-            *reinterpret_cast<int *>(const_cast<void *>(smem_addr)) = 0;
-        }
-    }
-#else
     int bytes = cond ? N : 0;
     unsigned int addr = __cvta_generic_to_shared(smem_addr);
     if constexpr (N == 16) {
@@ -238,28 +204,19 @@ __device__ __forceinline__ void cp_async_gs_conditional(void const *const smem_a
             ::"r"(addr),
             "l"(global_ptr), "n"(N), "r"(bytes));
     }
-#endif
 }
 
 template <int N>
-__device__ __forceinline__ void cp_async_wait(RWKV_ASYNC_PIPE_DECL) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
-    cuda::pipeline_consumer_wait_prior<N>(pipe);
-#else
+__device__ __forceinline__ void cp_async_wait() {
     if constexpr (N == 0) {
         asm volatile("cp.async.wait_all;\n" ::);
     } else {
         asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
     }
-#endif
 }
 
-__device__ __forceinline__ void cp_async_commit(RWKV_ASYNC_PIPE_DECL) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
-    pipe.producer_commit();
-#else
+__device__ __forceinline__ void cp_async_commit() {
     asm volatile("cp.async.commit_group;\n" ::);
-#endif
 }
 
 __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
@@ -276,7 +233,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
     const int by = blockIdx.y;
     const int t = threadIdx.x;
     const int start_pos = bx * MAXNPERBLOCK;
-    RWKV_ASYNC_PIPE_INIT
+
     if (t < 32){
         *(half2*)(vec_slice + t*2) = *(const half2*)(vec + start_pos + t*2);
     }
@@ -308,15 +265,14 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
     for(int i = 0; i < 2; i++){
         if (i < nnz_count){
             int actual_pos = start_pos + nnz_ids[i];
-            cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true
-                                       RWKV_ASYNC_PIPE_TAIL_PASS);
-            cp_async_commit(RWKV_ASYNC_PIPE_PASS);
+            cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
+            cp_async_commit();
         }
     }
     // main for
     for(int i = 0; i < nnz_count-2; i++){
         // take data
-        cp_async_wait<1>(RWKV_ASYNC_PIPE_PASS);
+        cp_async_wait<1>();
         __syncthreads();
 
         half2 mat_row_frag = *(half2*) (mat_row_smem[i%2] + t*2);
@@ -324,9 +280,8 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
 
         // store
         int actual_pos = start_pos + nnz_ids[i+2];
-        cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true
-                                   RWKV_ASYNC_PIPE_TAIL_PASS);
-        cp_async_commit(RWKV_ASYNC_PIPE_PASS);
+        cp_async_gs_conditional<4>(mat_row_smem[i%2] + t*2, mat + actual_pos * C + by * (2*BLOCKDIM) + t*2, true);
+        cp_async_commit();
 
         // compute
         out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
@@ -334,7 +289,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
 
     // end
     if (nnz_count >= 2){
-        cp_async_wait<1>(RWKV_ASYNC_PIPE_PASS);
+        cp_async_wait<1>();
         __syncthreads();
 
         half2 mat_row_frag = *(half2*) (mat_row_smem[nnz_count%2] + t*2);
@@ -343,7 +298,7 @@ __global__ void __launch_bounds__(BLOCKDIM, 1) spvecmatmul_noindices(
         out_frag = __hfma2(__half2half2(vec_value), mat_row_frag, out_frag);
     }
     if (nnz_count >= 1){
-        cp_async_wait<0>(RWKV_ASYNC_PIPE_PASS);
+        cp_async_wait<0>();
         __syncthreads();
 
         half2 mat_row_frag = *(half2*) (mat_row_smem[(nnz_count+1)%2] + t*2);
