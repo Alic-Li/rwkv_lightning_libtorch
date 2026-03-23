@@ -179,7 +179,7 @@ union common128 {
     float f[4];
 };
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 750)
 using rwkv_async_pipeline_t = cuda::pipeline<cuda::thread_scope_thread>;
 #define RWKV_ASYNC_PIPE_TAIL_DECL , rwkv_async_pipeline_t& pipe
 #define RWKV_ASYNC_PIPE_TAIL_PASS , pipe
@@ -200,7 +200,7 @@ __device__ __forceinline__ void cp_async_gs_conditional(void const *const smem_a
                                        void const *const global_ptr, bool cond
                                        RWKV_ASYNC_PIPE_TAIL_DECL) {
     static_assert(N == 16 || N == 8 || N == 4);
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 750)
     if (cond) {
         cuda::memcpy_async(
             const_cast<void *>(smem_addr),
@@ -243,7 +243,7 @@ __device__ __forceinline__ void cp_async_gs_conditional(void const *const smem_a
 
 template <int N>
 __device__ __forceinline__ void cp_async_wait(RWKV_ASYNC_PIPE_DECL) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 750)
     cuda::pipeline_consumer_wait_prior<N>(pipe);
 #else
     if constexpr (N == 0) {
@@ -255,7 +255,7 @@ __device__ __forceinline__ void cp_async_wait(RWKV_ASYNC_PIPE_DECL) {
 }
 
 __device__ __forceinline__ void cp_async_commit(RWKV_ASYNC_PIPE_DECL) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 800)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 750)
     pipe.producer_commit();
 #else
     asm volatile("cp.async.commit_group;\n" ::);
