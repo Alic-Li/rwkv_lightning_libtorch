@@ -1,5 +1,7 @@
 #include "rwkv_model.h"
 
+#include <algorithm>
+#include <regex>
 #include <stdexcept>
 
 #include "model_load/safetensors_loader.h"
@@ -62,13 +64,14 @@ torch::Tensor normalize_last_dim(const torch::Tensor& x) {
 
 std::vector<std::string> expected_tensor_names(int64_t n_layer) {
   std::vector<std::string> names = {
-      "__meta__",
       "emb.weight",
+      "blocks.0.ln0.weight",
+      "blocks.0.ln0.bias",
       "ln_out.weight",
       "ln_out.bias",
       "head.weight",
   };
-  names.reserve(5 + static_cast<size_t>(n_layer) * 33);
+  names.reserve(7 + static_cast<size_t>(n_layer) * 30);
 
   for (int64_t i = 0; i < n_layer; ++i) {
     const std::string bbb = "blocks." + std::to_string(i) + ".";
@@ -93,9 +96,6 @@ std::vector<std::string> expected_tensor_names(int64_t n_layer) {
             att + "a0",
             att + "a1",
             att + "a2",
-            att + "v0",
-            att + "v1",
-            att + "v2",
             att + "g1",
             att + "g2",
             att + "k_k",
@@ -115,34 +115,80 @@ std::vector<std::string> expected_tensor_names(int64_t n_layer) {
   return names;
 }
 
+int64_t infer_num_layers(const SafeTensorArchive& archive) {
+  const std::regex block_pattern(R"(^blocks\.(\d+)\.)");
+  int64_t max_layer = -1;
+  for (const auto& name : archive.tensor_names()) {
+    std::smatch match;
+    if (std::regex_search(name, match, block_pattern)) {
+      max_layer = std::max(
+          max_layer,
+          static_cast<int64_t>(std::stoll(match[1].str())));
+    }
+  }
+  TORCH_CHECK(max_layer >= 0, "failed to infer layer count from safetensors");
+  return max_layer + 1;
+}
+
+torch::Tensor squeeze_tensor(torch::Tensor tensor) {
+  return tensor.squeeze().contiguous();
+}
+
+torch::Tensor load_squeezed_tensor(
+    const SafeTensorArchive& archive,
+    const std::string& name,
+    torch::Device device) {
+  return squeeze_tensor(archive.load_tensor(name, device));
+}
+
+torch::Tensor load_preprocessed_embedding(
+    const SafeTensorArchive& archive,
+    torch::Device device) {
+  // Keep this preprocessing on CPU to mirror the old pth2st path and avoid
+  // backend-specific layer_norm differences during model init.
+  auto emb_weight = load_squeezed_tensor(archive, "emb.weight", torch::kCPU);
+  const auto ln0_weight =
+      load_squeezed_tensor(archive, "blocks.0.ln0.weight", torch::kCPU);
+  const auto ln0_bias =
+      load_squeezed_tensor(archive, "blocks.0.ln0.bias", torch::kCPU);
+  emb_weight = F::layer_norm(
+      emb_weight,
+      F::LayerNormFuncOptions({emb_weight.size(-1)})
+          .weight(ln0_weight)
+          .bias(ln0_bias));
+  return emb_weight.to(device).contiguous();
+}
+
 }  // namespace
 
 RWKVModel::RWKVModel(const std::string& weights_file, torch::Device device)
     : device_(std::move(device)) {
   SafeTensorArchive archive(weights_file);
 
-  auto meta = archive.load_tensor("__meta__", torch::kCPU).to(torch::kInt64);
-  TORCH_CHECK(meta.numel() == 5, "invalid meta tensor in ", weights_file);
-  n_layer_ = meta[0].item<int64_t>();
-  n_head_ = meta[1].item<int64_t>();
-  head_size_ = meta[2].item<int64_t>();
-  n_embd_ = meta[3].item<int64_t>();
-  vocab_size_ = meta[4].item<int64_t>();
+  n_layer_ = infer_num_layers(archive);
 
   auto expected_names = expected_tensor_names(n_layer_);
-  TORCH_CHECK(
-      archive.tensor_count() >= expected_names.size(),
-      "weights file is missing tensors in ",
-      weights_file,
-      ": expected at least ",
-      expected_names.size(),
-      ", got only ",
-      archive.tensor_count());
+  for (const auto& name : expected_names) {
+    TORCH_CHECK(
+        archive.has_tensor(name),
+        "missing tensor in safetensors file: ",
+        name);
+  }
 
-  emb_weight_ = archive.load_tensor("emb.weight", device_);
-  ln_out_weight_ = archive.load_tensor("ln_out.weight", device_);
-  ln_out_bias_ = archive.load_tensor("ln_out.bias", device_);
-  head_weight_ = archive.load_tensor("head.weight", device_);
+  emb_weight_ = load_preprocessed_embedding(archive, device_);
+
+  ln_out_weight_ = load_squeezed_tensor(archive, "ln_out.weight", device_);
+  ln_out_bias_ = load_squeezed_tensor(archive, "ln_out.bias", device_);
+  head_weight_ = load_squeezed_tensor(archive, "head.weight", device_);
+
+  vocab_size_ = emb_weight_.size(0);
+  n_embd_ = emb_weight_.size(1);
+  auto r_k = load_squeezed_tensor(archive, "blocks.0.att.r_k", device_);
+  TORCH_CHECK(
+      r_k.dim() == 2,
+      "expected blocks.0.att.r_k to have shape [n_head, head_size]");
+  n_head_ = r_k.size(0);
+  head_size_ = r_k.size(1);
 
   layers_.reserve(n_layer_);
   for (int64_t i = 0; i < n_layer_; ++i) {
@@ -150,43 +196,54 @@ RWKVModel::RWKVModel(const std::string& weights_file, torch::Device device)
     const std::string att = bbb + "att.";
     const std::string ffn = bbb + "ffn.";
     RWKVLayerWeights layer;
-    layer.ln1_weight = archive.load_tensor(bbb + "ln1.weight", device_);
-    layer.ln1_bias = archive.load_tensor(bbb + "ln1.bias", device_);
-    layer.ln2_weight = archive.load_tensor(bbb + "ln2.weight", device_);
-    layer.ln2_bias = archive.load_tensor(bbb + "ln2.bias", device_);
+    layer.ln1_weight = load_squeezed_tensor(archive, bbb + "ln1.weight", device_);
+    layer.ln1_bias = load_squeezed_tensor(archive, bbb + "ln1.bias", device_);
+    layer.ln2_weight = load_squeezed_tensor(archive, bbb + "ln2.weight", device_);
+    layer.ln2_bias = load_squeezed_tensor(archive, bbb + "ln2.bias", device_);
 
-    layer.att_x_r = archive.load_tensor(att + "x_r", device_);
-    layer.att_x_w = archive.load_tensor(att + "x_w", device_);
-    layer.att_x_k = archive.load_tensor(att + "x_k", device_);
-    layer.att_x_v = archive.load_tensor(att + "x_v", device_);
-    layer.att_x_a = archive.load_tensor(att + "x_a", device_);
-    layer.att_x_g = archive.load_tensor(att + "x_g", device_);
-    layer.att_w0 = archive.load_tensor(att + "w0", device_);
-    layer.att_w1 = archive.load_tensor(att + "w1", device_);
-    layer.att_w2 = archive.load_tensor(att + "w2", device_);
-    layer.att_a0 = archive.load_tensor(att + "a0", device_);
-    layer.att_a1 = archive.load_tensor(att + "a1", device_);
-    layer.att_a2 = archive.load_tensor(att + "a2", device_);
-    layer.att_v0 = archive.load_tensor(att + "v0", device_);
-    layer.att_v1 = archive.load_tensor(att + "v1", device_);
-    layer.att_v2 = archive.load_tensor(att + "v2", device_);
-    layer.att_g1 = archive.load_tensor(att + "g1", device_);
-    layer.att_g2 = archive.load_tensor(att + "g2", device_);
-    layer.att_k_k = archive.load_tensor(att + "k_k", device_);
-    layer.att_k_a = archive.load_tensor(att + "k_a", device_);
-    layer.att_r_k = archive.load_tensor(att + "r_k", device_);
+    layer.att_x_r = load_squeezed_tensor(archive, att + "x_r", device_);
+    layer.att_x_w = load_squeezed_tensor(archive, att + "x_w", device_);
+    layer.att_x_k = load_squeezed_tensor(archive, att + "x_k", device_);
+    layer.att_x_v = load_squeezed_tensor(archive, att + "x_v", device_);
+    layer.att_x_a = load_squeezed_tensor(archive, att + "x_a", device_);
+    layer.att_x_g = load_squeezed_tensor(archive, att + "x_g", device_);
+    layer.att_w0 = load_squeezed_tensor(archive, att + "w0", device_);
+    layer.att_w1 = load_squeezed_tensor(archive, att + "w1", device_);
+    layer.att_w2 = load_squeezed_tensor(archive, att + "w2", device_);
+    layer.att_a0 = load_squeezed_tensor(archive, att + "a0", device_);
+    layer.att_a1 = load_squeezed_tensor(archive, att + "a1", device_);
+    layer.att_a2 = load_squeezed_tensor(archive, att + "a2", device_);
+    if (i == 0) {
+      layer.att_v0 = layer.att_a0;
+      layer.att_v1 = layer.att_a1;
+      layer.att_v2 = layer.att_a2;
+    } else {
+      layer.att_v0 = load_squeezed_tensor(archive, att + "v0", device_);
+      layer.att_v1 = load_squeezed_tensor(archive, att + "v1", device_);
+      layer.att_v2 = load_squeezed_tensor(archive, att + "v2", device_);
+    }
+    layer.att_g1 = load_squeezed_tensor(archive, att + "g1", device_);
+    layer.att_g2 = load_squeezed_tensor(archive, att + "g2", device_);
+    layer.att_k_k = load_squeezed_tensor(archive, att + "k_k", device_);
+    layer.att_k_a = load_squeezed_tensor(archive, att + "k_a", device_);
+    layer.att_r_k =
+        load_squeezed_tensor(archive, att + "r_k", device_).flatten().contiguous();
     layer.att_receptance_weight =
-        archive.load_tensor(att + "receptance.weight", device_);
-    layer.att_key_weight = archive.load_tensor(att + "key.weight", device_);
-    layer.att_value_weight = archive.load_tensor(att + "value.weight", device_);
+        load_squeezed_tensor(archive, att + "receptance.weight", device_);
+    layer.att_key_weight = load_squeezed_tensor(archive, att + "key.weight", device_);
+    layer.att_value_weight =
+        load_squeezed_tensor(archive, att + "value.weight", device_);
     layer.att_output_weight =
-        archive.load_tensor(att + "output.weight", device_);
-    layer.att_ln_x_weight = archive.load_tensor(att + "ln_x.weight", device_);
-    layer.att_ln_x_bias = archive.load_tensor(att + "ln_x.bias", device_);
+        load_squeezed_tensor(archive, att + "output.weight", device_);
+    layer.att_ln_x_weight = load_squeezed_tensor(archive, att + "ln_x.weight", device_);
+    layer.att_ln_x_bias = load_squeezed_tensor(archive, att + "ln_x.bias", device_);
 
-    layer.ffn_x_k = archive.load_tensor(ffn + "x_k", device_);
-    layer.ffn_key_weight = archive.load_tensor(ffn + "key.weight", device_);
-    layer.ffn_value_weight = archive.load_tensor(ffn + "value.weight", device_);
+    layer.ffn_x_k = load_squeezed_tensor(archive, ffn + "x_k", device_);
+    layer.ffn_key_weight = load_squeezed_tensor(archive, ffn + "key.weight", device_);
+    layer.ffn_value_weight =
+        load_squeezed_tensor(archive, ffn + "value.weight", device_)
+            .transpose(0, 1)
+            .contiguous();
 
     layers_.push_back(std::move(layer));
   }

@@ -21,6 +21,106 @@ void xprint(const std::string& s) {
             << std::string(c1, '#') << "\n\n";
 }
 
+bool is_utf8_continuation(unsigned char byte) {
+  return (byte & 0xC0u) == 0x80u;
+}
+
+int utf8_sequence_length(unsigned char lead) {
+  if (lead <= 0x7Fu) {
+    return 1;
+  }
+  if (lead >= 0xC2u && lead <= 0xDFu) {
+    return 2;
+  }
+  if (lead >= 0xE0u && lead <= 0xEFu) {
+    return 3;
+  }
+  if (lead >= 0xF0u && lead <= 0xF4u) {
+    return 4;
+  }
+  return 0;
+}
+
+bool is_valid_utf8_sequence(const std::string& text, size_t pos, int len) {
+  const auto b0 = static_cast<unsigned char>(text[pos]);
+  switch (len) {
+    case 1:
+      return true;
+    case 2: {
+      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
+      return is_utf8_continuation(b1);
+    }
+    case 3: {
+      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
+      const auto b2 = static_cast<unsigned char>(text[pos + 2]);
+      if (!is_utf8_continuation(b1) || !is_utf8_continuation(b2)) {
+        return false;
+      }
+      if (b0 == 0xE0u && b1 < 0xA0u) {
+        return false;
+      }
+      if (b0 == 0xEDu && b1 >= 0xA0u) {
+        return false;
+      }
+      return true;
+    }
+    case 4: {
+      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
+      const auto b2 = static_cast<unsigned char>(text[pos + 2]);
+      const auto b3 = static_cast<unsigned char>(text[pos + 3]);
+      if (!is_utf8_continuation(b1) || !is_utf8_continuation(b2) || !is_utf8_continuation(b3)) {
+        return false;
+      }
+      if (b0 == 0xF0u && b1 < 0x90u) {
+        return false;
+      }
+      if (b0 == 0xF4u && b1 > 0x8Fu) {
+        return false;
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+std::string take_complete_utf8(std::string& pending, bool flush_all) {
+  std::string out;
+  size_t i = 0;
+  size_t last_copy = 0;
+  while (i < pending.size()) {
+    const auto lead = static_cast<unsigned char>(pending[i]);
+    const int len = utf8_sequence_length(lead);
+    if (len == 0) {
+      out.append(pending, last_copy, i - last_copy);
+      out += "\xEF\xBF\xBD";
+      ++i;
+      last_copy = i;
+      continue;
+    }
+    if (i + static_cast<size_t>(len) > pending.size()) {
+      break;
+    }
+    if (!is_valid_utf8_sequence(pending, i, len)) {
+      out.append(pending, last_copy, i - last_copy);
+      out += "\xEF\xBF\xBD";
+      ++i;
+      last_copy = i;
+      continue;
+    }
+    i += static_cast<size_t>(len);
+  }
+  out.append(pending, last_copy, i - last_copy);
+  pending.erase(0, i);
+  if (flush_all && !pending.empty()) {
+    for (size_t j = 0; j < pending.size(); ++j) {
+      out += "\xEF\xBF\xBD";
+    }
+    pending.clear();
+  }
+  return out;
+}
+
 std::vector<int64_t> parse_ids(const std::string& text) {
   std::vector<int64_t> ids;
   if (text.empty()) {
@@ -203,6 +303,7 @@ int main(int argc, char** argv) {
     std::vector<int64_t> generated;
     generated.reserve(decode_steps);
     std::string decoded;
+    std::string utf8_pending;
     std::vector<double> times;
     std::vector<double> all_times;
     times.reserve(decode_steps);
@@ -215,7 +316,11 @@ int main(int argc, char** argv) {
       generated.push_back(next);
       auto piece = tokenizer.decode(static_cast<int>(next));
       decoded += piece;
-      std::cout << piece << std::flush;
+      utf8_pending += piece;
+      const auto text = take_complete_utf8(utf8_pending, false);
+      if (!text.empty()) {
+        std::cout << text << std::flush;
+      }
       torch::cuda::synchronize();
       auto tf0 = std::chrono::steady_clock::now();
       logits = model.forward_decode({next}, state);
@@ -227,6 +332,10 @@ int main(int argc, char** argv) {
       all_times.push_back(
           std::chrono::duration_cast<std::chrono::duration<double>>(tf1 - t00)
               .count());
+    }
+    const auto tail = take_complete_utf8(utf8_pending, true);
+    if (!tail.empty()) {
+      std::cout << tail << std::flush;
     }
     torch::cuda::synchronize();
     auto t1 = std::chrono::steady_clock::now();

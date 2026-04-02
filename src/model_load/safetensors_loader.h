@@ -19,11 +19,14 @@ class SafeTensorArchive {
  public:
   explicit SafeTensorArchive(const std::string& path);
 
+  bool has_tensor(const std::string& name) const;
+
   torch::Tensor load_tensor(
       const std::string& name,
       torch::Device device) const;
 
   size_t tensor_count() const { return entries_.size(); }
+  std::vector<std::string> tensor_names() const;
 
  private:
   std::vector<char> bytes_;

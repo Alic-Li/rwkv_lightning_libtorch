@@ -9,9 +9,11 @@
 #include <sstream>
 #include <stdexcept>
 
+#include <ATen/DeviceAccelerator.h>
 #include <json/json.h>
 
 #include "sampling_api.h"
+#include "state_manager/state_pool.h"
 
 namespace {
 
@@ -40,6 +42,143 @@ std::string make_sse_payload(const std::vector<std::pair<int, std::string>>& cho
   return "data: " + Json::writeString(builder, chunk) + "\n\n";
 }
 
+bool is_utf8_continuation(unsigned char byte) {
+  return (byte & 0xC0u) == 0x80u;
+}
+
+int utf8_sequence_length(unsigned char lead) {
+  if (lead <= 0x7Fu) {
+    return 1;
+  }
+  if (lead >= 0xC2u && lead <= 0xDFu) {
+    return 2;
+  }
+  if (lead >= 0xE0u && lead <= 0xEFu) {
+    return 3;
+  }
+  if (lead >= 0xF0u && lead <= 0xF4u) {
+    return 4;
+  }
+  return 0;
+}
+
+bool is_valid_utf8_sequence(const std::string& text, size_t pos, int len) {
+  const auto b0 = static_cast<unsigned char>(text[pos]);
+  switch (len) {
+    case 1:
+      return true;
+    case 2: {
+      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
+      return is_utf8_continuation(b1);
+    }
+    case 3: {
+      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
+      const auto b2 = static_cast<unsigned char>(text[pos + 2]);
+      if (!is_utf8_continuation(b1) || !is_utf8_continuation(b2)) {
+        return false;
+      }
+      if (b0 == 0xE0u && b1 < 0xA0u) {
+        return false;
+      }
+      if (b0 == 0xEDu && b1 >= 0xA0u) {
+        return false;
+      }
+      return true;
+    }
+    case 4: {
+      const auto b1 = static_cast<unsigned char>(text[pos + 1]);
+      const auto b2 = static_cast<unsigned char>(text[pos + 2]);
+      const auto b3 = static_cast<unsigned char>(text[pos + 3]);
+      if (!is_utf8_continuation(b1) || !is_utf8_continuation(b2) || !is_utf8_continuation(b3)) {
+        return false;
+      }
+      if (b0 == 0xF0u && b1 < 0x90u) {
+        return false;
+      }
+      if (b0 == 0xF4u && b1 > 0x8Fu) {
+        return false;
+      }
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+std::string take_complete_utf8(std::string& pending, bool flush_all) {
+  std::string out;
+  size_t i = 0;
+  size_t last_copy = 0;
+  while (i < pending.size()) {
+    const auto lead = static_cast<unsigned char>(pending[i]);
+    const int len = utf8_sequence_length(lead);
+    if (len == 0) {
+      out.append(pending, last_copy, i - last_copy);
+      out += "\xEF\xBF\xBD";
+      ++i;
+      last_copy = i;
+      continue;
+    }
+    if (i + static_cast<size_t>(len) > pending.size()) {
+      break;
+    }
+    if (!is_valid_utf8_sequence(pending, i, len)) {
+      out.append(pending, last_copy, i - last_copy);
+      out += "\xEF\xBF\xBD";
+      ++i;
+      last_copy = i;
+      continue;
+    }
+    i += static_cast<size_t>(len);
+  }
+  out.append(pending, last_copy, i - last_copy);
+  pending.erase(0, i);
+  if (flush_all && !pending.empty()) {
+    for (size_t j = 0; j < pending.size(); ++j) {
+      out += "\xEF\xBF\xBD";
+    }
+    pending.clear();
+  }
+  return out;
+}
+
+std::string decode_complete_utf8(
+    const trie_tokenizer& tokenizer,
+    std::vector<int>& token_buffer,
+    std::string& utf8_pending,
+    bool flush_all) {
+  if (!token_buffer.empty()) {
+    utf8_pending += tokenizer.decode(token_buffer);
+    token_buffer.clear();
+  }
+  return take_complete_utf8(utf8_pending, flush_all);
+}
+
+void cleanup_device_cache(const c10::Device& device) {
+  if (!device.is_cuda() && device.type() != c10::DeviceType::HIP) {
+    return;
+  }
+  try {
+    at::accelerator::synchronizeDevice(device.index());
+  } catch (...) {
+  }
+  try {
+    at::accelerator::emptyCache();
+  } catch (...) {
+  }
+}
+
+void cleanup_request_tensors(
+    std::initializer_list<torch::Tensor*> tensors,
+    const c10::Device& device) {
+  for (auto* tensor : tensors) {
+    if (tensor != nullptr) {
+      *tensor = torch::Tensor();
+    }
+  }
+  cleanup_device_cache(device);
+}
+
 }  // namespace
 
 InferenceEngine::InferenceEngine(
@@ -62,6 +201,54 @@ std::vector<int64_t> InferenceEngine::encode_prompt(const std::string& prompt, b
     out.push_back(0);
   }
   return out;
+}
+
+InferenceEngine::PrefixPrefillResult InferenceEngine::prefill_prompt_with_prefix_cache(
+    const std::string& prompt) const {
+  auto encoded = encode_prompt(prompt, false);
+  if (encoded.empty()) {
+    throw std::runtime_error("prompt must not be empty");
+  }
+
+  RWKVState state;
+  torch::Tensor logits;
+  int matched_tokens = 0;
+
+  if (auto match = StateCacheManager::instance().match_prefix_state(encoded); match.has_value()) {
+    state = std::move(match->state);
+    if (match->logits.has_value()) {
+      logits = std::move(*match->logits);
+    }
+    matched_tokens = match->matched_tokens;
+  } else {
+    state = model_->generate_zero_state(1);
+  }
+
+  int cursor = matched_tokens;
+  for (int bucket : {1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192}) {
+    if (cursor >= bucket || static_cast<int>(encoded.size()) < bucket) {
+      continue;
+    }
+    std::vector<int64_t> segment(encoded.begin() + cursor, encoded.begin() + bucket);
+    if (!segment.empty()) {
+      logits = forward_variable_batch({segment}, state);
+      StateCacheManager::instance().put_prefix_state(
+          std::vector<int64_t>(encoded.begin(), encoded.begin() + bucket),
+          state,
+          logits);
+      cursor = bucket;
+    }
+  }
+
+  if (cursor < static_cast<int>(encoded.size())) {
+    std::vector<int64_t> remaining(encoded.begin() + cursor, encoded.end());
+    logits = forward_variable_batch({remaining}, state);
+  } else if (!logits.defined()) {
+    state = model_->generate_zero_state(1);
+    logits = forward_variable_batch({encoded}, state);
+  }
+
+  return PrefixPrefillResult{std::move(encoded), std::move(state), std::move(logits)};
 }
 
 torch::Tensor InferenceEngine::forward_variable_batch(
@@ -233,27 +420,6 @@ torch::Tensor InferenceEngine::sample_tokens_gumbel(
   return std::get<1>(logits.max(-1, false));
 }
 
-bool InferenceEngine::emit_sse_chunk(
-    const std::vector<std::vector<int>>& token_buffers,
-    const std::vector<int>& active_indices,
-    std::vector<std::vector<int>>& mutable_buffers,
-    const StreamCallback& emit) const {
-  std::vector<std::pair<int, std::string>> choices;
-  for (size_t slot = 0; slot < token_buffers.size(); ++slot) {
-    if (token_buffers[slot].empty()) {
-      continue;
-    }
-    choices.emplace_back(
-        active_indices[slot],
-        tokenizer_->decode(mutable_buffers[slot]));
-    mutable_buffers[slot].clear();
-  }
-  if (choices.empty()) {
-    return true;
-  }
-  return emit(make_sse_payload(choices));
-}
-
 std::vector<std::string> InferenceEngine::decode_all(
     const std::vector<std::vector<int>>& generated) const {
   std::vector<std::string> decoded;
@@ -271,7 +437,6 @@ std::vector<std::string> InferenceEngine::batch_generate(
     return {};
   }
 
-  std::lock_guard<std::mutex> lock(model_mutex_);
   auto state = model_->generate_zero_state(static_cast<int64_t>(prompts.size()));
   std::vector<std::vector<int64_t>> encoded;
   encoded.reserve(prompts.size());
@@ -294,6 +459,7 @@ std::vector<std::string> InferenceEngine::batch_generate(
 
   std::vector<std::vector<int>> generated(prompts.size());
   std::set<int64_t> stop_set(options.stop_tokens.begin(), options.stop_tokens.end());
+  const auto device = logits.device();
 
   for (int step = 0; step < options.max_tokens && !active.indices.empty(); ++step) {
     auto sampled = sample_tokens_with_penalties(logits, active.penalties, options).to(torch::kCPU);
@@ -323,7 +489,11 @@ std::vector<std::string> InferenceEngine::batch_generate(
     logits = decode_active(next_tokens, active);
   }
 
-  return decode_all(generated);
+  auto decoded = decode_all(generated);
+  active.state = RWKVState();
+  active.penalties = torch::Tensor();
+  cleanup_request_tensors({&logits}, device);
+  return decoded;
 }
 
 std::vector<std::string> InferenceEngine::continuous_batching(
@@ -346,13 +516,13 @@ std::vector<std::string> InferenceEngine::batch_generate_state(
     return {};
   }
 
-  std::lock_guard<std::mutex> lock(model_mutex_);
   auto logits = forward_variable_batch({encode_prompt(prompts.front(), false)}, state);
   auto penalties =
       torch::zeros({1, model_->vocab_size()},
                    torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
   std::set<int64_t> stop_set(options.stop_tokens.begin(), options.stop_tokens.end());
   std::vector<int> generated;
+  const auto device = logits.device();
 
   for (int step = 0; step < options.max_tokens; ++step) {
     auto next = sample_tokens_with_penalties(logits, penalties, options).to(torch::kCPU)[0].item<int64_t>();
@@ -364,7 +534,36 @@ std::vector<std::string> InferenceEngine::batch_generate_state(
     logits = model_->forward_decode({next}, state);
   }
 
-  return {tokenizer_->decode(generated)};
+  auto decoded = std::vector<std::string>{tokenizer_->decode(generated)};
+  cleanup_request_tensors({&logits, &penalties}, device);
+  return decoded;
+}
+
+std::string InferenceEngine::single_generate_with_prefix_cache(
+    const std::string& prompt,
+    const GenerateOptions& options) const {
+  auto prefill = prefill_prompt_with_prefix_cache(prompt);
+  auto penalties =
+      torch::zeros({1, model_->vocab_size()},
+                   torch::TensorOptions().dtype(torch::kFloat32).device(prefill.logits.device()));
+  std::set<int64_t> stop_set(options.stop_tokens.begin(), options.stop_tokens.end());
+  std::vector<int> generated;
+  const auto device = prefill.logits.device();
+
+  for (int step = 0; step < options.max_tokens; ++step) {
+    auto next =
+        sample_tokens_with_penalties(prefill.logits, penalties, options).to(torch::kCPU)[0].item<int64_t>();
+    if (stop_set.count(next)) {
+      break;
+    }
+    generated.push_back(static_cast<int>(next));
+    penalties.index_put_({0, next}, penalties.index({0, next}) + 1.0f);
+    prefill.logits = model_->forward_decode({next}, prefill.state);
+  }
+
+  const auto decoded = tokenizer_->decode(generated);
+  cleanup_request_tensors({&prefill.logits, &penalties}, device);
+  return decoded;
 }
 
 void InferenceEngine::batch_generate_stream(
@@ -377,7 +576,6 @@ void InferenceEngine::batch_generate_stream(
     return;
   }
 
-  std::lock_guard<std::mutex> lock(model_mutex_);
   auto state = model_->generate_zero_state(static_cast<int64_t>(prompts.size()));
   std::vector<std::vector<int64_t>> encoded;
   encoded.reserve(prompts.size());
@@ -401,6 +599,8 @@ void InferenceEngine::batch_generate_stream(
   std::set<int64_t> stop_set(options.stop_tokens.begin(), options.stop_tokens.end());
   std::vector<std::vector<int>> generated(prompts.size());
   std::vector<std::vector<int>> token_buffers(prompts.size());
+  std::vector<std::string> utf8_pending(prompts.size());
+  const auto device = logits.device();
 
   for (int step = 0; step < options.max_tokens && !active.indices.empty(); ++step) {
     auto sampled = sample_tokens_with_penalties(logits, active.penalties, options).to(torch::kCPU);
@@ -414,10 +614,12 @@ void InferenceEngine::batch_generate_stream(
       const auto token = sampled[slot].item<int64_t>();
       const auto original_index = active.indices[static_cast<size_t>(slot)];
       auto& buffer = token_buffers[static_cast<size_t>(original_index)];
+      auto& pending = utf8_pending[static_cast<size_t>(original_index)];
       if (stop_set.count(token)) {
-        if (!buffer.empty()) {
-          choices.emplace_back(original_index, tokenizer_->decode(buffer));
-          buffer.clear();
+        const auto text =
+            decode_complete_utf8(*tokenizer_, buffer, pending, true);
+        if (!text.empty()) {
+          choices.emplace_back(original_index, text);
         }
         continue;
       }
@@ -429,12 +631,18 @@ void InferenceEngine::batch_generate_stream(
       keep_slots.push_back(slot);
 
       if (static_cast<int>(buffer.size()) >= chunk_size) {
-        choices.emplace_back(original_index, tokenizer_->decode(buffer));
-        buffer.clear();
+        const auto text =
+            decode_complete_utf8(*tokenizer_, buffer, pending, false);
+        if (!text.empty()) {
+          choices.emplace_back(original_index, text);
+        }
       }
     }
 
     if (!choices.empty() && !emit(make_sse_payload(choices))) {
+      active.state = RWKVState();
+      active.penalties = torch::Tensor();
+      cleanup_request_tensors({&logits}, device);
       return;
     }
     if (keep_slots.empty()) {
@@ -448,13 +656,21 @@ void InferenceEngine::batch_generate_stream(
 
   std::vector<std::pair<int, std::string>> tail;
   for (size_t i = 0; i < token_buffers.size(); ++i) {
-    if (!token_buffers[i].empty()) {
-      tail.emplace_back(static_cast<int>(i), tokenizer_->decode(token_buffers[i]));
+    const auto text =
+        decode_complete_utf8(*tokenizer_, token_buffers[i], utf8_pending[i], true);
+    if (!text.empty()) {
+      tail.emplace_back(static_cast<int>(i), text);
     }
   }
   if (!tail.empty() && !emit(make_sse_payload(tail))) {
+    active.state = RWKVState();
+    active.penalties = torch::Tensor();
+    cleanup_request_tensors({&logits}, device);
     return;
   }
+  active.state = RWKVState();
+  active.penalties = torch::Tensor();
+  cleanup_request_tensors({&logits}, device);
   emit("data: [DONE]\n\n");
 }
 
@@ -485,13 +701,14 @@ void InferenceEngine::batch_generate_state_stream(
     return;
   }
 
-  std::lock_guard<std::mutex> lock(model_mutex_);
   auto logits = forward_variable_batch({encode_prompt(prompts.front(), false)}, state);
   auto penalties =
       torch::zeros({1, model_->vocab_size()},
                    torch::TensorOptions().dtype(torch::kFloat32).device(logits.device()));
   std::set<int64_t> stop_set(options.stop_tokens.begin(), options.stop_tokens.end());
   std::vector<int> buffer;
+  std::string utf8_pending;
+  const auto device = logits.device();
 
   for (int step = 0; step < options.max_tokens; ++step) {
     const auto token = sample_tokens_with_penalties(logits, penalties, options).to(torch::kCPU)[0].item<int64_t>();
@@ -501,17 +718,63 @@ void InferenceEngine::batch_generate_state_stream(
     buffer.push_back(static_cast<int>(token));
     penalties.index_put_({0, token}, penalties.index({0, token}) + 1.0f);
     if (static_cast<int>(buffer.size()) >= chunk_size) {
-      if (!emit(make_sse_payload({{0, tokenizer_->decode(buffer)}}))) {
+      const auto text =
+          decode_complete_utf8(*tokenizer_, buffer, utf8_pending, false);
+      if (!text.empty() && !emit(make_sse_payload({{0, text}}))) {
+        cleanup_request_tensors({&logits, &penalties}, device);
         return;
       }
-      buffer.clear();
     }
     logits = model_->forward_decode({token}, state);
   }
 
-  if (!buffer.empty() && !emit(make_sse_payload({{0, tokenizer_->decode(buffer)}}))) {
+  const auto tail = decode_complete_utf8(*tokenizer_, buffer, utf8_pending, true);
+  if (!tail.empty() && !emit(make_sse_payload({{0, tail}}))) {
+    cleanup_request_tensors({&logits, &penalties}, device);
     return;
   }
+  cleanup_request_tensors({&logits, &penalties}, device);
+  emit("data: [DONE]\n\n");
+}
+
+void InferenceEngine::single_generate_stream_with_prefix_cache(
+    const std::string& prompt,
+    const GenerateOptions& options,
+    int chunk_size,
+    const StreamCallback& emit) const {
+  auto prefill = prefill_prompt_with_prefix_cache(prompt);
+  auto penalties =
+      torch::zeros({1, model_->vocab_size()},
+                   torch::TensorOptions().dtype(torch::kFloat32).device(prefill.logits.device()));
+  std::set<int64_t> stop_set(options.stop_tokens.begin(), options.stop_tokens.end());
+  std::vector<int> buffer;
+  std::string utf8_pending;
+  const auto device = prefill.logits.device();
+
+  for (int step = 0; step < options.max_tokens; ++step) {
+    const auto token =
+        sample_tokens_with_penalties(prefill.logits, penalties, options).to(torch::kCPU)[0].item<int64_t>();
+    if (stop_set.count(token)) {
+      break;
+    }
+    buffer.push_back(static_cast<int>(token));
+    penalties.index_put_({0, token}, penalties.index({0, token}) + 1.0f);
+    if (static_cast<int>(buffer.size()) >= chunk_size) {
+      const auto text = decode_complete_utf8(*tokenizer_, buffer, utf8_pending, false);
+      if (!text.empty() && !emit(make_sse_payload({{0, text}}))) {
+        cleanup_request_tensors({&prefill.logits, &penalties}, device);
+        return;
+      }
+    }
+    prefill.logits = model_->forward_decode({token}, prefill.state);
+  }
+
+  const auto tail = decode_complete_utf8(*tokenizer_, buffer, utf8_pending, true);
+  if (!tail.empty() && !emit(make_sse_payload({{0, tail}}))) {
+    cleanup_request_tensors({&prefill.logits, &penalties}, device);
+    return;
+  }
+  cleanup_request_tensors({&prefill.logits, &penalties}, device);
   emit("data: [DONE]\n\n");
 }
 
@@ -527,7 +790,6 @@ void InferenceEngine::big_batch_stream(
     return;
   }
 
-  std::lock_guard<std::mutex> lock(model_mutex_);
   auto state = model_->generate_zero_state(static_cast<int64_t>(prompts.size()));
   std::vector<std::vector<int64_t>> encoded;
   encoded.reserve(prompts.size());
@@ -538,7 +800,10 @@ void InferenceEngine::big_batch_stream(
   auto logits = forward_variable_batch(encoded, state);
   std::set<int64_t> stop_set(stop_tokens.begin(), stop_tokens.end());
   std::vector<std::vector<int>> token_buffers(prompts.size());
+  std::vector<std::string> utf8_pending(prompts.size());
   std::vector<bool> finished(prompts.size(), false);
+  const auto device = logits.device();
+  int step_count = 0;
 
   while (max_tokens-- > 0 && std::any_of(finished.begin(), finished.end(), [](bool v) { return !v; })) {
     auto sampled = sample_tokens_gumbel(logits, temperature).to(torch::kCPU);
@@ -554,34 +819,50 @@ void InferenceEngine::big_batch_stream(
       }
       if (stop_set.count(token)) {
         finished[i] = true;
-        if (!token_buffers[i].empty()) {
-          choices.emplace_back(static_cast<int>(i), tokenizer_->decode(token_buffers[i]));
-          token_buffers[i].clear();
+        const auto text =
+            decode_complete_utf8(*tokenizer_, token_buffers[i], utf8_pending[i], true);
+        if (!text.empty()) {
+          choices.emplace_back(static_cast<int>(i), text);
         }
         continue;
       }
       token_buffers[i].push_back(static_cast<int>(token));
       if (static_cast<int>(token_buffers[i].size()) >= chunk_size) {
-        choices.emplace_back(static_cast<int>(i), tokenizer_->decode(token_buffers[i]));
-        token_buffers[i].clear();
+        const auto text =
+            decode_complete_utf8(*tokenizer_, token_buffers[i], utf8_pending[i], false);
+        if (!text.empty()) {
+          choices.emplace_back(static_cast<int>(i), text);
+        }
       }
     }
 
     if (!choices.empty() && !emit(make_sse_payload(choices))) {
+      state = RWKVState();
+      cleanup_request_tensors({&logits}, device);
       return;
     }
     logits = model_->forward_decode(next_tokens, state);
+    ++step_count;
+    if (step_count % 100 == 0) {
+      cleanup_device_cache(device);
+    }
   }
 
   std::vector<std::pair<int, std::string>> tail;
   for (size_t i = 0; i < token_buffers.size(); ++i) {
-    if (!token_buffers[i].empty()) {
-      tail.emplace_back(static_cast<int>(i), tokenizer_->decode(token_buffers[i]));
+    const auto text =
+        decode_complete_utf8(*tokenizer_, token_buffers[i], utf8_pending[i], true);
+    if (!text.empty()) {
+      tail.emplace_back(static_cast<int>(i), text);
     }
   }
   if (!tail.empty() && !emit(make_sse_payload(tail))) {
+    state = RWKVState();
+    cleanup_request_tensors({&logits}, device);
     return;
   }
+  state = RWKVState();
+  cleanup_request_tensors({&logits}, device);
   emit("data: [DONE]\n\n");
 }
 

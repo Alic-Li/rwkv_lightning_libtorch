@@ -346,6 +346,19 @@ SafeTensorArchive::SafeTensorArchive(const std::string& path) {
   TORCH_CHECK(!entries_.empty(), "empty safetensors header in ", path);
 }
 
+bool SafeTensorArchive::has_tensor(const std::string& name) const {
+  return entries_.find(name) != entries_.end();
+}
+
+std::vector<std::string> SafeTensorArchive::tensor_names() const {
+  std::vector<std::string> names;
+  names.reserve(entries_.size());
+  for (const auto& [name, _] : entries_) {
+    names.push_back(name);
+  }
+  return names;
+}
+
 torch::Tensor SafeTensorArchive::load_tensor(
     const std::string& name,
     torch::Device device) const {

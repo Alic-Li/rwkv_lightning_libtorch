@@ -3,28 +3,29 @@ RWKV Batch infer backend Base on [Albatross](https://github.com/BlinkDL/Albatros
 - Thanks to [Rapid-Sampling](https://github.com/Triang-jyed-driung/Rapid-Sampling) Kernel From [Triang-jyed-driung](https://github.com/Triang-jyed-driung), it also have native HIP kerel compatible with ROCm😎
 
 ## Export Weights
+- You can download the original weights from [**RWKV-7-ST**](https://www.modelscope.cn/models/shoumenchougou/RWKV-7-World-ST)
 
-The original Python checkpoint is a `torch.save` state dict. It must be
-preprocessed once and exported to a single `.safetensors` file first.
+The original Python checkpoint is a `torch.save` state dict. Convert it to a
+single `.safetensors` file with `convert_safetensors.py` first.
 
 ```bash
 cd rwkv_lightning_libtorch
 
-python pth2st.py \
-  --model /mnt/sda1/rwkv_weights/rwkv7-g1e-7.2b-20260301-ctx8192.pth \
-  --out /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
+python convert_safetensors.py \
+  --input /mnt/sda1/rwkv_weights/rwkv7-g1e-7.2b-20260301-ctx8192.pth \
+  --output /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.st \
 ```
 
-This script applies the same weight preprocessing used by Albatross:
+The C++ loader now reads the `convert_safetensors.py` output format directly
+and applies the remaining runtime conversions it needs when loading:
 
-- transpose selected matrices
-- apply `squeeze`
 - flatten `att.r_k`
 - apply `blocks.0.ln0` to `emb.weight`
-- rename `blocks.0.att.v0/v1/v2` to `a0/a1/a2`
+- reuse `blocks.0.att.a0/a1/a2` for layer-0 `v0/v1/v2`
+- transpose `ffn.value.weight`
 
-The exported `.safetensors` stores model metadata in `__meta__` and all
-preprocessed weights by tensor name.
+Model metadata is inferred from tensor names and shapes in the safetensors
+archive, so no extra `__meta__` tensor is required.
 
 ## Build
 **Install the Dorgon framework**
@@ -76,7 +77,7 @@ Run the bundled binary:
 
 ```bash
 ./build/dist/bin/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
+    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.st \
     --vocab src/infer/rwkv_vocab_v20230424.txt \
     --decode-prompt "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --decode-steps 512 \
@@ -95,7 +96,7 @@ Single-sample decode:
 
 ```bash
 ./build/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
+    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.st \
     --vocab src/infer/rwkv_vocab_v20230424.txt \
     --decode-prompt "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --decode-steps 512 \
@@ -107,7 +108,7 @@ sequences:
 
 ```bash
 ./build/benchmark \
-    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.safetensors \
+    --weights /mnt/sda1/rwkv_weights/libtorch_st/rwkv7-g1e-7.2b-20260301-ctx8192.st \
     --vocab src/infer/rwkv_vocab_v20230424.txt \
     --batch-prompts-text "User: simulate SpaceX mars landing using python\n\nAssistant: <think" \
     --batch-size 8 \
@@ -395,69 +396,7 @@ curl -X POST http://localhost:8000/v2/chat/completions \
 </details>
 
 
-### 4. ```v3/chat/completions``` [Support all decode parameters]
-
-<details>
-<summary>curl examples</summary>
-
-- Streaming asynchronous batch processing With CUDA Graph For Bsz=1
-```bash
-curl -X POST http://localhost:8000/v3/chat/completions \
-  -H "Content-Type: application/json" \
-  -N \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": true,
-    "enable_think": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-- Non-streaming asynchronous batch processing With CUDA Graph For Bsz=1
-```bash
-curl -X POST http://localhost:8000/v3/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [
-      {
-        "role": "user",
-        "content": "What is the capital of France?"
-      }
-    ],
-    "max_tokens": 1024,
-    "stop_tokens": [0, 261, 24281],
-    "temperature": 1.0,
-    "top_k": 1,
-    "top_p": 0.3,
-    "pad_zero": true,
-    "alpha_presence": 0.8,
-    "alpha_frequency": 0.8,
-    "alpha_decay": 0.996,
-    "chunk_size": 128,
-    "stream": false,
-    "enable_think": true,
-    "password": "rwkv7_7.2b"
-  }'
-```
-
-</details>
-
-
-### 5. ```state/chat/completions``` [Support state cache manager] 😜
+### 4. ```state/chat/completions``` [Support state cache manager] 😜
 
 #### Have 3 Levels Cache design 🤓
 - **L1 cache(VRAM) 16**
@@ -480,7 +419,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
   -N \
   -d '{
     "contents": [
-      "User: What should we eat for dinner? Any brief suggestions?\\n\\nAssistant: <think>\\n</think>\\n"
+      "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -502,7 +441,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
       -H "Content-Type: application/json" \
       -d '{
     "contents": [
-      "User: What should we eat for dinner? Any brief suggestions?\\n\\nAssistant: <think>\\n</think>\\n"
+      "User: What should we eat for dinner? Any brief suggestions?\n\nAssistant: <think>\n</think>\n"
     ],
     "max_tokens": 1024,
     "stop_tokens": [0, 261, 24281],
@@ -521,7 +460,7 @@ curl -X POST http://localhost:8000/state/chat/completions \
 </details>
 
 
-### 6. **State Management API** [Support state cache manager] 😜 
+### 5. **State Management API** [Support state cache manager] 😜 
 
 #### Use ```state/status```  Interface to check the state pool status of a session
 
@@ -555,8 +494,10 @@ curl -X POST http://localhost:8000/state/delete \
 
 </details>
 
-### 7. ```/openai/v1/chat/completions``` [Open AI format support]
+### 6. ```/openai/v1/chat/completions``` [Open AI format support]
 - "could be used for chat fronted which OpenAI API compatibility. Such as Cherry studio."
+- **Experimental tool-call parsing is non-streaming only.** Set `"stream": false` when you want the server to extract `tool_calls` from the model output.
+- When a tool call is parsed successfully, any text before or after the tool-call payload is preserved as the assistant message `content`.
 <details>
 <summary>curl examples</summary>
 
@@ -592,9 +533,33 @@ curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
     "stream": false
   }'
 ```
+
+- Stateful incremental Open AI API with `session_id`
+```bash
+curl -X POST 'http://localhost:8000/openai/v1/chat/completions' \
+  --header 'Content-Type: application/json' \
+  --header 'Authorization: Bearer your-password-if-set' \
+  --data '{
+    "model": "rwkv7",
+    "session_id": "demo-session-001",
+    "messages": [
+      {"role": "user", "content": "Please continue from our last turn and give me 3 short ideas."}
+    ],
+    "top_p": 0.6,
+    "max_tokens": 512,
+    "temperature": 0.8,
+    "stream": false
+  }'
+```
+
+- Related focused test scripts
+```bash
+python test/test_openai_adapter.py
+python test/test_openai_routes.py
+```
 </details>
 
-### 8. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]
+### 7. ```/big_batch/completions```  [Only Support noise & temperature decode parameters]
 
 <details>
 <summary>curl examples</summary>

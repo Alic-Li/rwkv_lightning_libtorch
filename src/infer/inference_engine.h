@@ -2,7 +2,6 @@
 
 #include <functional>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -11,10 +10,10 @@
 #include "utils/tokenizer.h"
 
 struct GenerateOptions {
-  int max_tokens = 512;
+  int max_tokens = 8192;
   std::vector<int64_t> stop_tokens{0, 261, 24281};
   double temperature = 1.0;
-  int top_k = 50;
+  int top_k = 20;
   double top_p = 0.6;
   double alpha_presence = 1.0;
   double alpha_frequency = 0.1;
@@ -49,6 +48,9 @@ class InferenceEngine {
       const std::vector<std::string>& prompts,
       RWKVState& state,
       const GenerateOptions& options) const;
+  std::string single_generate_with_prefix_cache(
+      const std::string& prompt,
+      const GenerateOptions& options) const;
 
   void batch_generate_stream(
       const std::vector<std::string>& prompts,
@@ -71,6 +73,11 @@ class InferenceEngine {
   void batch_generate_state_stream(
       const std::vector<std::string>& prompts,
       RWKVState& state,
+      const GenerateOptions& options,
+      int chunk_size,
+      const StreamCallback& emit) const;
+  void single_generate_stream_with_prefix_cache(
+      const std::string& prompt,
       const GenerateOptions& options,
       int chunk_size,
       const StreamCallback& emit) const;
@@ -101,7 +108,14 @@ class InferenceEngine {
     std::vector<int> indices;
   };
 
+  struct PrefixPrefillResult {
+    std::vector<int64_t> encoded_prompt;
+    RWKVState state;
+    torch::Tensor logits;
+  };
+
   std::vector<int64_t> encode_prompt(const std::string& prompt, bool pad_zero) const;
+  PrefixPrefillResult prefill_prompt_with_prefix_cache(const std::string& prompt) const;
   torch::Tensor forward_variable_batch(
       const std::vector<std::vector<int64_t>>& token_batches,
       RWKVState& state) const;
@@ -123,16 +137,10 @@ class InferenceEngine {
       torch::Tensor logits,
       double temperature,
       double eps = 6.2e-5) const;
-  bool emit_sse_chunk(
-      const std::vector<std::vector<int>>& token_buffers,
-      const std::vector<int>& active_indices,
-      std::vector<std::vector<int>>& mutable_buffers,
-      const StreamCallback& emit) const;
   std::vector<std::string> decode_all(
       const std::vector<std::vector<int>>& generated) const;
 
   std::shared_ptr<RWKVModel> model_;
   std::shared_ptr<trie_tokenizer> tokenizer_;
   std::string model_name_;
-  mutable std::mutex model_mutex_;
 };

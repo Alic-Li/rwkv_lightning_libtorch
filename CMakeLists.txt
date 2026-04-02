@@ -131,7 +131,7 @@ add_library(
   src/state_manager/state_pool.cpp
 )
 
-target_link_libraries(rwkv_backend_support PUBLIC rwkv_infer_core SQLite::SQLite3)
+target_link_libraries(rwkv_backend_support PUBLIC rwkv_infer_core SQLite3::SQLite3)
 target_include_directories(rwkv_backend_support PUBLIC src src/infer src/infer/utils)
 target_compile_options(rwkv_backend_support PRIVATE -O3)
 

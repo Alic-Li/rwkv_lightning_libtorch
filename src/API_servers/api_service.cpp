@@ -4,6 +4,7 @@
 #include <cctype>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -69,12 +70,12 @@ bool check_password(
 
 GenerateOptions parse_options(const Json::Value& body) {
   GenerateOptions options;
-  options.max_tokens = body.get("max_tokens", 512).asInt();
+  options.max_tokens = body.get("max_tokens", 8192).asInt();
   options.temperature = body.get("temperature", 1.0).asDouble();
-  options.top_k = body.get("top_k", 50).asInt();
+  options.top_k = body.get("top_k", 20).asInt();
   options.top_p = body.get("top_p", 0.6).asDouble();
-  options.alpha_presence = body.get("alpha_presence", 2.0).asDouble();
-  options.alpha_frequency = body.get("alpha_frequency", 0.2).asDouble();
+  options.alpha_presence = body.get("alpha_presence", 1.0).asDouble();
+  options.alpha_frequency = body.get("alpha_frequency", 0.1).asDouble();
   options.alpha_decay = body.get("alpha_decay", 0.996).asDouble();
   options.pad_zero = body.get("pad_zero", true).asBool();
   if (body.isMember("stop_tokens") && body["stop_tokens"].isArray()) {
@@ -175,6 +176,10 @@ HttpResponsePtr make_sse_response(const std::function<void(ResponseStreamPtr)>& 
   return resp;
 }
 
+void release_request_state(RWKVState& state) {
+  state = RWKVState();
+}
+
 void start_streaming_task(
     ResponseStreamPtr stream,
     const std::function<void(const InferenceEngine::StreamCallback&)>& task) {
@@ -206,8 +211,19 @@ std::string extract_openai_prompt(const Json::Value& body) {
 }
 
 std::string format_openai_prompt(const Json::Value& body, const InferenceEngine& engine) {
-  std::vector<std::pair<std::string, std::string>> messages;
-  std::string system = body.get("system", "").asString();
+  std::string current_prompt;
+  const auto contents = parse_contents(body);
+  if (!contents.empty()) {
+    current_prompt = contents.front();
+  }
+
+  std::vector<std::pair<std::string, std::string>> history_messages;
+  std::vector<std::string> system_parts;
+  const auto system_field = body.get("system", "").asString();
+  if (!system_field.empty()) {
+    system_parts.push_back(system_field);
+  }
+
   if (body.isMember("messages") && body["messages"].isArray()) {
     for (const auto& msg : body["messages"]) {
       auto role = msg.get("role", "user").asString();
@@ -216,22 +232,54 @@ std::string format_openai_prompt(const Json::Value& body, const InferenceEngine&
         continue;
       }
       if (role == "system") {
-        if (!system.empty()) {
-          system += "\n\n";
-        }
-        system += content;
+        system_parts.push_back(content);
         continue;
       }
       if (!role.empty()) {
         role[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(role[0])));
       }
-      messages.emplace_back(role.empty() ? "User" : role, content);
+      history_messages.emplace_back(role.empty() ? "User" : role, content);
     }
+  }
+
+  if (current_prompt.empty() && !history_messages.empty()) {
+    current_prompt = history_messages.back().second;
+  }
+
+  if (!current_prompt.empty() && !history_messages.empty() &&
+      history_messages.back().second == current_prompt) {
+    history_messages.pop_back();
+  }
+
+  std::vector<std::pair<std::string, std::string>> messages;
+  for (const auto& system : system_parts) {
+    if (!system.empty()) {
+      messages.emplace_back("System", system);
+    }
+  }
+  for (const auto& [role, content] : history_messages) {
+    messages.emplace_back(role, content);
+  }
+  if (!current_prompt.empty()) {
+    messages.emplace_back("User", current_prompt);
   }
   if (messages.empty()) {
     messages.emplace_back("User", extract_openai_prompt(body));
   }
-  return engine.format_openai_prompt(system, messages, body.get("enable_think", false).asBool());
+
+  std::string system;
+  std::vector<std::pair<std::string, std::string>> dialogue_messages;
+  for (const auto& [role, content] : messages) {
+    if (role == "System") {
+      if (!system.empty()) {
+        system += "\n\n";
+      }
+      system += content;
+    } else {
+      dialogue_messages.emplace_back(role, content);
+    }
+  }
+  return engine.format_openai_prompt(system, dialogue_messages, body.get("enable_think", false).asBool());
 }
 
 Json::Value build_openai_response(
@@ -259,6 +307,130 @@ Json::Value build_openai_response(
   return resp;
 }
 
+std::string make_openai_response_id() {
+  static thread_local std::mt19937_64 rng(
+      static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+  std::ostringstream oss;
+  oss << "chatcmpl-" << std::hex << rng();
+  return oss.str();
+}
+
+std::string json_to_sse(const Json::Value& payload) {
+  Json::StreamWriterBuilder builder;
+  builder["emitUTF8"] = true;
+  builder["indentation"] = "";
+  return "data: " + Json::writeString(builder, payload) + "\n\n";
+}
+
+Json::Value build_openai_stream_chunk_base(
+    const std::string& response_id,
+    Json::Int64 created,
+    const std::string& model) {
+  Json::Value chunk;
+  chunk["id"] = response_id;
+  chunk["object"] = "chat.completion.chunk";
+  chunk["created"] = created;
+  chunk["model"] = model;
+  chunk["choices"] = Json::arrayValue;
+  return chunk;
+}
+
+bool stream_openai_from_internal(
+    const InferenceEngine::StreamCallback& emit,
+    const std::function<void(const InferenceEngine::StreamCallback&)>& producer,
+    const std::string& response_id,
+    Json::Int64 created,
+    const std::string& model) {
+  Json::Value start = build_openai_stream_chunk_base(response_id, created, model);
+  Json::Value start_choice;
+  start_choice["index"] = 0;
+  start_choice["delta"]["role"] = "assistant";
+  start_choice["finish_reason"] = Json::Value::null;
+  start["choices"].append(start_choice);
+  if (!emit(json_to_sse(start))) {
+    return false;
+  }
+
+  bool sent_finish = false;
+  auto wrapped_emit = [&](const std::string& raw) -> bool {
+    if (raw == "data: [DONE]\n\n") {
+      if (!sent_finish) {
+        Json::Value finish = build_openai_stream_chunk_base(response_id, created, model);
+        Json::Value finish_choice;
+        finish_choice["index"] = 0;
+        finish_choice["delta"] = Json::Value(Json::objectValue);
+        finish_choice["finish_reason"] = "stop";
+        finish["choices"].append(finish_choice);
+        if (!emit(json_to_sse(finish))) {
+          return false;
+        }
+        sent_finish = true;
+      }
+      return emit("data: [DONE]\n\n");
+    }
+
+    constexpr std::string_view prefix = "data: ";
+    if (raw.rfind(prefix.data(), 0) != 0) {
+      return true;
+    }
+    const auto payload = raw.substr(prefix.size(), raw.size() - prefix.size() - 2);
+    Json::CharReaderBuilder reader_builder;
+    std::unique_ptr<Json::CharReader> reader(reader_builder.newCharReader());
+    Json::Value parsed;
+    std::string errs;
+    if (!reader->parse(payload.data(), payload.data() + payload.size(), &parsed, &errs)) {
+      return true;
+    }
+
+    const auto& choices = parsed["choices"];
+    if (!choices.isArray() || choices.empty()) {
+      return true;
+    }
+
+    const auto content = choices[0]["delta"].get("content", "").asString();
+    const auto finish_reason = choices[0]["finish_reason"];
+    if (!content.empty()) {
+      Json::Value chunk = build_openai_stream_chunk_base(response_id, created, model);
+      Json::Value choice;
+      choice["index"] = 0;
+      choice["delta"]["content"] = content;
+      choice["finish_reason"] = Json::Value::null;
+      chunk["choices"].append(choice);
+      if (!emit(json_to_sse(chunk))) {
+        return false;
+      }
+    }
+    if (!finish_reason.isNull()) {
+      Json::Value chunk = build_openai_stream_chunk_base(response_id, created, model);
+      Json::Value choice;
+      choice["index"] = 0;
+      choice["delta"] = Json::Value(Json::objectValue);
+      choice["finish_reason"] = finish_reason;
+      chunk["choices"].append(choice);
+      sent_finish = true;
+      if (!emit(json_to_sse(chunk))) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  producer(wrapped_emit);
+  if (!sent_finish) {
+    Json::Value finish = build_openai_stream_chunk_base(response_id, created, model);
+    Json::Value finish_choice;
+    finish_choice["index"] = 0;
+    finish_choice["delta"] = Json::Value(Json::objectValue);
+    finish_choice["finish_reason"] = "stop";
+    finish["choices"].append(finish_choice);
+    if (!emit(json_to_sse(finish))) {
+      return false;
+    }
+    sent_finish = true;
+  }
+  return emit("data: [DONE]\n\n");
+}
+
 }  // namespace
 
 void register_api_routes(
@@ -282,7 +454,6 @@ void register_api_routes(
            "/v1/models",
            "/v1/chat/completions",
            "/v2/chat/completions",
-           "/v3/chat/completions",
            "/translate/v1/batch-translate",
            "/FIM/v1/batch-FIM",
            "/state/chat/completions",
@@ -384,60 +555,6 @@ void register_api_routes(
         resp["object"] = "chat.completion";
         resp["model"] = (*json).get("model", "rwkv7").asString();
         resp["choices"] = build_choices(engine.continuous_batching(prompts, options));
-        cb(json_response(std::move(resp)));
-      },
-      {Post});
-
-  app.registerHandler(
-      "/v3/chat/completions",
-      [&engine, password](const HttpRequestPtr& req, std::function<void(const HttpResponsePtr&)>&& cb) {
-        auto json = req->getJsonObject();
-        if (!json) {
-          cb(json_response(make_error("Invalid JSON"), k400BadRequest));
-          return;
-        }
-        HttpResponsePtr auth_resp;
-        if (!check_password(req, *json, password, auth_resp)) {
-          cb(auth_resp);
-          return;
-        }
-
-        auto prompts = parse_contents(*json);
-        if (prompts.empty() && (*json).isMember("messages")) {
-          for (const auto& msg : (*json)["messages"]) {
-            if (msg.get("role", "").asString() == "user") {
-              prompts.push_back(normalize_content(msg["content"]));
-            }
-          }
-        }
-        if (prompts.empty()) {
-          cb(json_response(make_error("Empty prompts list"), k400BadRequest));
-          return;
-        }
-
-        const auto enable_think = (*json).get("enable_think", false).asBool();
-        for (auto& prompt : prompts) {
-          prompt = enable_think ? ("User: " + prompt + "\n\nAssistant: <think")
-                                : ("User: " + prompt + "\n\nAssistant: <think>\n</think>");
-        }
-        auto options = parse_options(*json);
-        if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, prompts, options, chunk_size = (*json).get("chunk_size", 4).asInt()](
-                                   ResponseStreamPtr stream) {
-            start_streaming_task(
-                std::move(stream),
-                [&, prompts, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
-                  engine.graph_generate_stream(prompts, options, chunk_size, emit);
-                });
-          }));
-          return;
-        }
-
-        Json::Value resp;
-        resp["id"] = "rwkv7-batch-v3";
-        resp["object"] = "chat.completion";
-        resp["model"] = (*json).get("model", "rwkv7").asString();
-        resp["choices"] = build_choices(engine.graph_generate(prompts, options));
         cb(json_response(std::move(resp)));
       },
       {Post});
@@ -592,12 +709,14 @@ void register_api_routes(
                     const InferenceEngine::StreamCallback& emit) mutable {
                   engine.batch_generate_state_stream(prompts, state, options, chunk_size, emit);
                   manager.put_state(session_id, state);
+                  release_request_state(state);
                 });
           }));
           return;
         }
         auto texts = engine.batch_generate_state(prompts, state, options);
         manager.put_state(session_id, state);
+        release_request_state(state);
         Json::Value resp;
         resp["id"] = "rwkv7-batch";
         resp["object"] = "chat.completion";
@@ -658,6 +777,7 @@ void register_api_routes(
                   const auto next_idx = allocate_next_dialogue_idx(manager, session_index);
                   const auto new_session_id = session_index + ":" + std::to_string(next_idx);
                   manager.put_state(new_session_id, state);
+                  release_request_state(state);
                   Json::Value meta;
                   meta["object"] = "multi_state.dialogue_idx";
                   meta["session_id"] = new_session_id;
@@ -673,6 +793,7 @@ void register_api_routes(
         auto texts = engine.batch_generate_state(prompts, *state, options);
         const auto next_idx = allocate_next_dialogue_idx(manager, session_index);
         manager.put_state(session_index + ":" + std::to_string(next_idx), *state);
+        release_request_state(*state);
         Json::Value resp;
         resp["id"] = "rwkv7-multi-state";
         resp["object"] = "chat.completion";
@@ -797,19 +918,43 @@ void register_api_routes(
         }
         const auto prompt = format_openai_prompt(*json, engine);
         const auto options = parse_options(*json);
+        const bool use_prefix_cache = (*json).get("use_prefix_cache", true).asBool();
+        const auto response_id = make_openai_response_id();
+        const auto created = static_cast<Json::Int64>(
+            std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
+        const auto model_name = (*json).get("model", engine.model_name()).asString();
         if ((*json).get("stream", false).asBool()) {
-          cb(make_sse_response([&engine, prompt, options, chunk_size = (*json).get("chunk_size", 4).asInt()](
+          cb(make_sse_response([&engine, prompt, options, use_prefix_cache, response_id, created, model_name,
+                                chunk_size = (*json).get("chunk_size", 4).asInt()](
                                    ResponseStreamPtr stream) {
             start_streaming_task(
                 std::move(stream),
-                [&, prompt, options, chunk_size](const InferenceEngine::StreamCallback& emit) {
-                  engine.batch_generate_stream({prompt}, options, chunk_size, emit);
+                [&, prompt, options, use_prefix_cache, chunk_size, response_id, created, model_name](
+                    const InferenceEngine::StreamCallback& emit) {
+                  stream_openai_from_internal(
+                      emit,
+                      [&](const InferenceEngine::StreamCallback& inner_emit) {
+                        if (use_prefix_cache) {
+                          engine.single_generate_stream_with_prefix_cache(prompt, options, chunk_size, inner_emit);
+                          return;
+                        }
+                        engine.batch_generate_stream({prompt}, options, chunk_size, inner_emit);
+                      },
+                      response_id,
+                      created,
+                      model_name);
                 });
           }));
           return;
         }
-        const auto texts = engine.batch_generate({prompt}, options);
-        cb(json_response(build_openai_response(engine, *json, prompt, texts.empty() ? std::string{} : texts.front())));
+        const auto texts = use_prefix_cache
+                               ? std::vector<std::string>{engine.single_generate_with_prefix_cache(prompt, options)}
+                               : engine.batch_generate({prompt}, options);
+        auto resp = build_openai_response(engine, *json, prompt, texts.empty() ? std::string{} : texts.front());
+        resp["id"] = response_id;
+        resp["created"] = created;
+        resp["model"] = model_name;
+        cb(json_response(std::move(resp)));
       },
       {Post});
 }

@@ -3,4 +3,5 @@ __pycache__/
 rwkv_sessions.db
 build/
 uploads/
-
+.codex
+rwkv_lightning/
